@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+import time
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 
@@ -11,6 +13,7 @@ from app.config import Settings, get_settings
 from app.routers import supporters, visits
 from app.services.supabase import SupabaseService
 from app.services.telegram import TelegramService
+from app.services.visit_crypto import VisitCryptoService
 from app.services.visits import VisitService
 
 
@@ -25,6 +28,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.http_client = client
         app.state.supabase = SupabaseService(runtime_settings, client)
         app.state.telegram = TelegramService(runtime_settings, client)
+        app.state.visit_crypto = VisitCryptoService(runtime_settings)
         app.state.visits = VisitService(
             runtime_settings,
             app.state.supabase,
@@ -35,7 +39,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title=runtime_settings.app_name,
-        version="1.0.0",
+        version="1.1.0",
         debug=runtime_settings.debug,
         lifespan=lifespan,
     )
@@ -46,20 +50,53 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_credentials=False,
         allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Accept", "Content-Type", "X-Admin-Key"],
+        expose_headers=["X-Supporters-Source", "Warning"],
         max_age=600,
     )
     if runtime_settings.allowed_hosts != ["*"]:
-        app.add_middleware(TrustedHostMiddleware, allowed_hosts=runtime_settings.allowed_hosts)
+        app.add_middleware(
+            TrustedHostMiddleware,
+            allowed_hosts=runtime_settings.allowed_hosts,
+        )
 
-    @app.get("/health", tags=["system"])
-    async def health() -> dict[str, object]:
+    started_at = time.monotonic()
+
+    def health_payload() -> dict[str, object]:
         return {
             "ok": True,
             "service": runtime_settings.app_name,
+            "version": "1.1.0",
             "environment": runtime_settings.app_environment,
+            "serverTime": datetime.now(timezone.utc).isoformat(),
+            "uptimeSeconds": round(time.monotonic() - started_at, 3),
             "supabaseConfigured": runtime_settings.supabase_enabled,
             "telegramConfigured": runtime_settings.telegram_enabled,
+            "visitEncryptionConfigured": app.state.visit_crypto.enabled,
         }
+
+    def set_health_headers(response: Response) -> None:
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["X-Robots-Tag"] = "noindex, nofollow"
+
+    @app.get("/", tags=["system"], include_in_schema=False)
+    async def root(response: Response) -> dict[str, object]:
+        set_health_headers(response)
+        return {
+            "ok": True,
+            "service": runtime_settings.app_name,
+            "health": "/health",
+            "docs": "/docs",
+        }
+
+    @app.get("/health", tags=["system"], include_in_schema=True)
+    async def health(response: Response) -> dict[str, object]:
+        set_health_headers(response)
+        return health_payload()
+
+    @app.get(f"{runtime_settings.api_prefix}/health", tags=["system"])
+    async def api_health(response: Response) -> dict[str, object]:
+        set_health_headers(response)
+        return health_payload()
 
     app.include_router(supporters.router, prefix=runtime_settings.api_prefix)
     app.include_router(visits.router, prefix=runtime_settings.api_prefix)

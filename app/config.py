@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 from functools import lru_cache
+
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+
+# Built-in supporter cache defaults. The server uses these values even when
+# the corresponding environment variables are not configured on Render.
+SUPPORTERS_CACHE_TTL_SECONDS = 60
+SUPPORTERS_STALE_CACHE_SECONDS = 86400
 
 
 def _split_csv(value: str) -> list[str]:
@@ -35,14 +41,25 @@ class Settings(BaseSettings):
     supabase_secret_key: str = ""
     supporters_admin_key: str = ""
     max_supporters: int = Field(default=100, ge=1, le=500)
+    supporters_cache_ttl_seconds: int = Field(
+        default=SUPPORTERS_CACHE_TTL_SECONDS,
+        ge=0,
+        le=3600,
+    )
+    supporters_stale_cache_seconds: int = Field(
+        default=SUPPORTERS_STALE_CACHE_SECONDS,
+        ge=0,
+        le=604800,
+    )
 
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     visit_alert_enabled: bool = True
     visit_hash_salt: str = "development-only-change-me"
+    visit_private_key_b64: str = ""
+    require_encrypted_visits: bool = True
     visit_alert_cooldown_minutes: int = Field(default=30, ge=1, le=1440)
     require_visit_storage: bool = False
-
 
     @property
     def backend_cors_origins(self) -> list[str]:
@@ -78,11 +95,26 @@ class Settings(BaseSettings):
         }
         if self.is_production:
             if self.visit_hash_salt in placeholder_salts or len(self.visit_hash_salt) < 24:
-                raise ValueError("VISIT_HASH_SALT must be a unique secret of at least 24 characters in production.")
+                raise ValueError(
+                    "VISIT_HASH_SALT must be a unique secret of at least 24 characters in production."
+                )
+            if self.require_encrypted_visits and not self.visit_private_key_b64.strip():
+                raise ValueError(
+                    "VISIT_PRIVATE_KEY_B64 is required when REQUIRE_ENCRYPTED_VISITS=true."
+                )
             if self.supporters_admin_key and len(self.supporters_admin_key) < 24:
-                raise ValueError("SUPPORTERS_ADMIN_KEY must contain at least 24 characters in production.")
+                raise ValueError(
+                    "SUPPORTERS_ADMIN_KEY must contain at least 24 characters in production."
+                )
         if self.require_visit_storage and not self.supabase_enabled:
-            raise ValueError("Supabase settings are required when REQUIRE_VISIT_STORAGE=true.")
+            raise ValueError(
+                "Supabase settings are required when REQUIRE_VISIT_STORAGE=true."
+            )
+        if self.supporters_stale_cache_seconds < self.supporters_cache_ttl_seconds:
+            raise ValueError(
+                "SUPPORTERS_STALE_CACHE_SECONDS must be greater than or equal to "
+                "SUPPORTERS_CACHE_TTL_SECONDS."
+            )
         return self
 
 

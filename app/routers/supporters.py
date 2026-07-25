@@ -4,7 +4,7 @@ from decimal import Decimal
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 
 from app.config import Settings
 from app.dependencies import get_app_settings, get_supabase, require_admin
@@ -35,17 +35,41 @@ def _provider_error(exc: Exception) -> HTTPException:
     )
 
 
+def _set_public_headers(response: Response, source: str, stale: bool) -> None:
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    response.headers["X-Supporters-Source"] = source
+    if stale:
+        response.headers["Warning"] = '110 - "Response is stale"'
+
+
 @router.get("", response_model=SupportersResponse)
 async def list_supporters(
+    response: Response,
     limit: Annotated[int | None, Query(ge=1, le=500)] = None,
     settings: Settings = Depends(get_app_settings),
     supabase: SupabaseService = Depends(get_supabase),
 ) -> SupportersResponse:
+    requested_limit = min(limit or settings.max_supporters, settings.max_supporters)
+
     if not supabase.enabled:
-        return SupportersResponse(supporters=[])
+        source = "not-configured"
+        _set_public_headers(response, source, False)
+        return SupportersResponse(supporters=[], source=source)
+
     try:
-        rows = await supabase.list_supporters(min(limit or settings.max_supporters, settings.max_supporters))
-        return SupportersResponse(supporters=rows)
+        resilient_reader = getattr(supabase, "list_supporters_resilient", None)
+        if callable(resilient_reader):
+            rows, source, stale = await resilient_reader(requested_limit)
+        else:
+            rows = await supabase.list_supporters(requested_limit)
+            source, stale = "supabase", False
+
+        _set_public_headers(response, source, stale)
+        return SupportersResponse(
+            supporters=rows,
+            source=source,
+            stale=stale,
+        )
     except SupabaseError as exc:
         raise _provider_error(exc) from exc
 

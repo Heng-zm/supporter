@@ -118,6 +118,8 @@ class SupporterOut(BaseModel):
 class SupportersResponse(BaseModel):
     ok: bool = True
     supporters: list[SupporterOut]
+    source: str = "supabase"
+    stale: bool = False
 
 
 class SupporterResponse(BaseModel):
@@ -175,6 +177,15 @@ class VisitPayload(BaseModel):
     connection: ConnectionInfo = Field(
         default_factory=ConnectionInfo, validation_alias=AliasChoices("connection", "network")
     )
+
+
+class EncryptedVisitEnvelope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    encryption: str = Field(pattern=r"^rsa-oaep-aes-gcm-v1$")
+    encryptedKey: str = Field(min_length=100, max_length=2000)
+    iv: str = Field(min_length=16, max_length=64)
+    ciphertext: str = Field(min_length=24, max_length=90000)
 
 
 class VisitResponse(BaseModel):
