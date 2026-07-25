@@ -1,0 +1,1 @@
+"""Ozo donation backend package."""
