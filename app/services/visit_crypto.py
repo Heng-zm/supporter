@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import logging
 from typing import Any
 
 from cryptography.exceptions import InvalidTag
@@ -17,24 +18,46 @@ from app.models import EncryptedVisitEnvelope, VisitPayload
 ENCRYPTION_NAME = "rsa-oaep-aes-gcm-v1"
 AAD = b"ozo-visit-v1"
 
+logger = logging.getLogger("app.visit_crypto")
+
 
 class VisitCryptoService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._private_key: rsa.RSAPrivateKey | None = None
+        self.load_error: str | None = None
 
-        encoded_key = settings.visit_private_key_b64.strip()
-        if encoded_key:
-            try:
-                pem = base64.b64decode(encoded_key, validate=True)
-                key = serialization.load_pem_private_key(pem, password=None)
-            except (ValueError, TypeError, binascii.Error) as exc:
-                raise ValueError("VISIT_PRIVATE_KEY_B64 is not a valid base64 PEM private key.") from exc
+        # Strip ALL whitespace, not just leading/trailing. Env-var dashboards
+        # (Render, Docker, .env editors) frequently wrap or inject newlines
+        # into long pasted values, which base64.b64decode(..., validate=True)
+        # then rejects as invalid characters even though .strip() alone found
+        # nothing to trim.
+        raw_value = settings.visit_private_key_b64 or ""
+        encoded_key = "".join(raw_value.split())
+
+        if not encoded_key:
+            return
+
+        try:
+            pem = base64.b64decode(encoded_key, validate=True)
+            key = serialization.load_pem_private_key(pem, password=None)
             if not isinstance(key, rsa.RSAPrivateKey):
                 raise ValueError("VISIT_PRIVATE_KEY_B64 must contain an RSA private key.")
             if key.key_size < 2048:
                 raise ValueError("Visit RSA private key must be at least 2048 bits.")
-            self._private_key = key
+        except (ValueError, TypeError, binascii.Error) as exc:
+            # A malformed key must not take down the whole API. Log loudly
+            # and continue with encryption disabled instead of crashing
+            # FastAPI's startup (which previously produced a hard deploy
+            # failure with no clear indication that the key was the cause).
+            self.load_error = str(exc) or "VISIT_PRIVATE_KEY_B64 is not a valid base64 PEM private key."
+            logger.error(
+                "Visit encryption key could not be loaded; encryption is DISABLED: %s",
+                self.load_error,
+            )
+            return
+
+        self._private_key = key
 
     @property
     def enabled(self) -> bool:

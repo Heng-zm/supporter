@@ -62,7 +62,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     started_at = time.monotonic()
 
     def health_payload() -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "ok": True,
             "service": runtime_settings.app_name,
             "version": "1.1.0",
@@ -73,6 +73,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "telegramConfigured": runtime_settings.telegram_enabled,
             "visitEncryptionConfigured": app.state.visit_crypto.enabled,
         }
+        # Never leak the reason in production; it's only a debugging aid.
+        if not runtime_settings.is_production and app.state.visit_crypto.load_error:
+            payload["visitEncryptionError"] = app.state.visit_crypto.load_error
+        return payload
 
     def set_health_headers(response: Response) -> None:
         response.headers["Cache-Control"] = "no-store, max-age=0"
