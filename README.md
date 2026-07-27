@@ -2,8 +2,13 @@
 
 FastAPI backend for supporter management, encrypted visit alerts, Supabase storage, and Telegram administration.
 
-## Version 1.3.1 improvements
+## Version 1.3.2 improvements
 
+- Fixes Supabase/PostgREST error `42P10` when Telegram `/add` uses `on_conflict=telegram_update_id`.
+- Replaces the partial Telegram update index with a normal unique index that still permits multiple `NULL` values.
+- Adds actionable Telegram replies for outdated schema, missing tables/columns, and denied Supabase credentials.
+- Preserves Supabase HTTP status and PostgREST error codes in server logs without exposing secrets.
+- Fixes the protected HTTP supporter-create path passing an invalid duplicate argument.
 - Fixes Telegram `/add` parsing when the optional message is omitted before an avatar URL.
 - Supports multiline `/add` commands and preserves explicit empty optional fields.
 - Adds a secure Telegram `/add` command through a webhook.
@@ -58,13 +63,13 @@ For group chats, `TELEGRAM_ADMIN_USER_IDS` is mandatory.
 
 ## Upgrade from the previous version
 
-Run the updated `supabase_schema.sql` once in the Supabase SQL editor. It replaces the partial Telegram update index with a normal unique index so PostgREST can use:
+For the fastest fix, run `supabase_migration_v1_3_2.sql` once in the Supabase SQL Editor. It replaces the partial Telegram update index with a normal unique index so PostgREST can use:
 
 ```text
 on_conflict=telegram_update_id
 ```
 
-The migration is idempotent and also updates the recent-visitor lookup index.
+PostgreSQL normal unique indexes permit multiple `NULL` values, so supporters created outside Telegram remain valid. The migration is idempotent and refreshes PostgREST's schema cache. A fresh installation can run the complete `supabase_schema.sql` instead.
 
 ## Setup
 

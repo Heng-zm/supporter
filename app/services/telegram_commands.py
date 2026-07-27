@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import time
 from dataclasses import dataclass
@@ -14,6 +15,9 @@ from app.config import Settings
 from app.models import SupporterCreate, TelegramMessage, TelegramUpdate
 from app.services.supabase import SupabaseError, SupabaseService
 from app.services.telegram import TelegramService
+
+
+logger = logging.getLogger("app.telegram_commands")
 
 
 ADD_USAGE = (
@@ -135,6 +139,51 @@ def _format_amount(amount: Decimal, currency: str) -> str:
     return f"${number}" if currency == "USD" else f"{number} {currency}"
 
 
+def _database_error_message(exc: SupabaseError) -> str:
+    code = (exc.code or "").upper()
+    status_code = exc.status_code
+
+    if code == "42P10":
+        return (
+            "❌ <b>Supabase schema update required</b>\n"
+            "Run <code>supabase_migration_v1_3_2.sql</code> in the Supabase "
+            "SQL Editor, then send the command again.\n"
+            "Error code: <code>42P10</code>"
+        )
+    if code == "42703":
+        return (
+            "❌ <b>Supabase supporter columns are outdated</b>\n"
+            "Run <code>supabase_schema.sql</code> in the Supabase SQL Editor, "
+            "then retry.\n"
+            "Error code: <code>42703</code>"
+        )
+    if code in {"42P01", "PGRST205"} or status_code == 404:
+        return (
+            "❌ <b>Supabase supporters table was not found</b>\n"
+            "Run <code>supabase_schema.sql</code> in the Supabase SQL Editor, "
+            "then retry."
+        )
+    if status_code in {401, 403}:
+        return (
+            "❌ <b>Supabase access was denied</b>\n"
+            "Set <code>SUPABASE_SECRET_KEY</code> to the project service-role "
+            "secret on Render, then redeploy."
+        )
+    if status_code == 400:
+        suffix = f"\nError code: <code>{escape(code)}</code>" if code else ""
+        return (
+            "❌ <b>Supabase rejected the supporter insert</b>\n"
+            "Run the latest <code>supabase_schema.sql</code>, then check the "
+            f"Render logs if it still fails.{suffix}"
+        )
+    if exc.is_transient:
+        return "❌ The supporter database is temporarily unavailable. Please try again."
+    return (
+        "❌ The supporter could not be saved. Check the Render logs and "
+        "Supabase configuration, then try again."
+    )
+
+
 class TelegramCommandService:
     def __init__(
         self,
@@ -224,11 +273,14 @@ class TelegramCommandService:
                 _supporter_row(parsed.supporter),
                 update.update_id,
             )
-        except SupabaseError:
-            await self._reply(
-                message,
-                "❌ The supporter database is temporarily unavailable. Please try again.",
+        except SupabaseError as exc:
+            logger.warning(
+                "Telegram /add failed: update_id=%s status=%s code=%s",
+                update.update_id,
+                exc.status_code,
+                exc.code,
             )
+            await self._reply(message, _database_error_message(exc))
             return
 
         created_name = escape(str(created.get("name") or parsed.supporter.name))

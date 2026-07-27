@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from typing import Any
 from urllib.parse import quote
@@ -14,10 +15,26 @@ PUBLIC_SUPPORTER_COLUMNS = (
     "id,name,amount,currency,message,avatar_url,payment_method,created_at"
 )
 TRANSIENT_STATUS_CODES = {429, 502, 503, 504}
+logger = logging.getLogger("app.supabase")
 
 
 class SupabaseError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        code: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+        self.detail = detail
+
+    @property
+    def is_transient(self) -> bool:
+        return self.status_code in TRANSIENT_STATUS_CODES or self.status_code is None
 
 
 class SupabaseService:
@@ -93,9 +110,40 @@ class SupabaseService:
                 continue
 
             if response.status_code >= 400:
-                detail = response.text[:1000]
+                raw_detail = response.text[:1000]
+                error_code: str | None = None
+                error_detail = raw_detail or "Unknown Supabase error."
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = None
+                if isinstance(payload, dict):
+                    value = payload.get("code")
+                    if value is not None:
+                        error_code = str(value)
+                    candidates = (
+                        payload.get("message"),
+                        payload.get("details"),
+                        payload.get("hint"),
+                    )
+                    error_detail = next(
+                        (str(item) for item in candidates if item),
+                        error_detail,
+                    )
+
+                logger.warning(
+                    "Supabase request failed: method=%s table=%s status=%s code=%s detail=%s",
+                    method.upper(),
+                    table,
+                    response.status_code,
+                    error_code or "unknown",
+                    error_detail[:500],
+                )
                 raise SupabaseError(
-                    f"Supabase returned {response.status_code}: {detail}"
+                    f"Supabase returned {response.status_code}: {error_detail}",
+                    status_code=response.status_code,
+                    code=error_code,
+                    detail=error_detail,
                 )
             if response.status_code == 204 or not response.content:
                 return None
