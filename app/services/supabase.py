@@ -14,6 +14,7 @@ from app.config import Settings
 PUBLIC_SUPPORTER_COLUMNS = (
     "id,name,amount,currency,message,avatar_url,payment_method,created_at"
 )
+ADMIN_SUPPORTER_COLUMNS = f"{PUBLIC_SUPPORTER_COLUMNS},is_visible"
 TRANSIENT_STATUS_CODES = {429, 502, 503, 504}
 logger = logging.getLogger("app.supabase")
 
@@ -281,6 +282,36 @@ class SupabaseService:
                 raise
 
             return rows, "supabase", False
+
+    async def list_supporters_admin(
+        self,
+        *,
+        limit: int,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        rows = await self._request(
+            "GET",
+            "supporters",
+            params={
+                "select": ADMIN_SUPPORTER_COLUMNS,
+                "order": "created_at.desc,amount.desc",
+                "limit": str(limit),
+                "offset": str(max(0, offset)),
+            },
+        )
+        return rows if isinstance(rows, list) else []
+
+    async def get_supporter(self, supporter_id: str) -> dict[str, Any] | None:
+        rows = await self._request(
+            "GET",
+            "supporters",
+            params={
+                "select": ADMIN_SUPPORTER_COLUMNS,
+                "id": f"eq.{quote(supporter_id, safe='')}",
+                "limit": "1",
+            },
+        )
+        return rows[0] if isinstance(rows, list) and rows else None
 
     async def create_supporter(self, row: dict[str, Any]) -> dict[str, Any]:
         rows = await self._request(

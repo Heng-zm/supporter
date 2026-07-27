@@ -149,6 +149,7 @@ class TelegramService:
         text: str,
         *,
         reply_to_message_id: int | None = None,
+        reply_markup: dict[str, Any] | None = None,
     ) -> TelegramResult:
         payload: dict[str, Any] = {
             "chat_id": str(chat_id),
@@ -158,9 +159,45 @@ class TelegramService:
         }
         if reply_to_message_id is not None:
             payload["reply_parameters"] = {"message_id": reply_to_message_id}
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         # sendMessage is not retried after ambiguous network failures because
         # Telegram has no client idempotency key and a retry could duplicate it.
         return await self._call("sendMessage", payload)
+
+    async def edit_message_text(
+        self,
+        chat_id: str | int,
+        message_id: int,
+        text: str,
+        *,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> TelegramResult:
+        payload: dict[str, Any] = {
+            "chat_id": str(chat_id),
+            "message_id": message_id,
+            "text": text[:4096],
+            "parse_mode": "HTML",
+            "link_preview_options": {"is_disabled": True},
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        return await self._call("editMessageText", payload, retry_safe=True)
+
+    async def answer_callback_query(
+        self,
+        callback_query_id: str,
+        text: str | None = None,
+        *,
+        show_alert: bool = False,
+    ) -> TelegramResult:
+        payload: dict[str, Any] = {
+            "callback_query_id": callback_query_id,
+            "show_alert": show_alert,
+        }
+        if text:
+            payload["text"] = text[:200]
+        return await self._call("answerCallbackQuery", payload, retry_safe=True)
 
     async def send_visit(self, visit: dict[str, Any]) -> TelegramResult:
         if not self.settings.telegram_visit_alert_enabled:
@@ -180,7 +217,7 @@ class TelegramService:
             {
                 "url": self.settings.telegram_webhook_url,
                 "secret_token": self.settings.telegram_webhook_secret,
-                "allowed_updates": ["message"],
+                "allowed_updates": ["message", "callback_query"],
                 "drop_pending_updates": False,
             },
             retry_safe=True,
@@ -191,7 +228,10 @@ class TelegramService:
             "setMyCommands",
             {
                 "commands": [
+                    {"command": "manage", "description": "Open supporter manager"},
+                    {"command": "list", "description": "List supporters"},
                     {"command": "add", "description": "Add a new supporter"},
+                    {"command": "cancel", "description": "Cancel current action"},
                     {"command": "help", "description": "Show command help"},
                 ]
             },

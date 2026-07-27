@@ -56,3 +56,53 @@ async def test_safe_configuration_call_retries_telegram_429(monkeypatch) -> None
 
     assert result.ok is True
     assert calls == 2
+
+
+async def test_webhook_configuration_enables_callback_queries() -> None:
+    payloads: list[dict[str, object]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        payloads.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"ok": True, "result": True})
+
+    settings = Settings(
+        telegram_bot_token="token",
+        telegram_webhook_url="https://example.com/api/telegram/webhook",
+        telegram_webhook_secret="abcdefghijklmnopqrstuvwxyz_123456",
+        require_encrypted_visits=False,
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        service = TelegramService(settings, client)
+        result = await service.configure_webhook()
+
+    assert result.ok is True
+    assert payloads[0]["allowed_updates"] == ["message", "callback_query"]
+
+
+async def test_send_message_includes_inline_keyboard() -> None:
+    payloads: list[dict[str, object]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        payloads.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={"ok": True, "result": {"message_id": 123}},
+        )
+
+    settings = Settings(
+        telegram_bot_token="token",
+        require_encrypted_visits=False,
+    )
+    keyboard = {
+        "inline_keyboard": [[{"text": "Add", "callback_data": "sp:add"}]]
+    }
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        service = TelegramService(settings, client)
+        result = await service.send_message("123", "Menu", reply_markup=keyboard)
+
+    assert result.ok is True
+    assert payloads[0]["reply_markup"] == keyboard

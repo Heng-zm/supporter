@@ -2,31 +2,79 @@
 
 FastAPI backend for supporter management, encrypted visit alerts, Supabase storage, and Telegram administration.
 
-## Version 1.3.2 improvements
+## Version 1.4.0 improvements
 
-- Fixes Supabase/PostgREST error `42P10` when Telegram `/add` uses `on_conflict=telegram_update_id`.
-- Replaces the partial Telegram update index with a normal unique index that still permits multiple `NULL` values.
-- Adds actionable Telegram replies for outdated schema, missing tables/columns, and denied Supabase credentials.
-- Preserves Supabase HTTP status and PostgREST error codes in server logs without exposing secrets.
-- Fixes the protected HTTP supporter-create path passing an invalid duplicate argument.
-- Fixes Telegram `/add` parsing when the optional message is omitted before an avatar URL.
-- Supports multiline `/add` commands and preserves explicit empty optional fields.
-- Adds a secure Telegram `/add` command through a webhook.
-- Prevents unexpected command failures from suppressing Telegram webhook retries.
-- Keeps Telegram supporter creation idempotent across retries and restarts.
-- Corrects the PostgreSQL unique index used by PostgREST `on_conflict` handling.
-- Retries safe Telegram webhook configuration calls after temporary `429` or `5xx` responses.
-- Rejects malformed Telegram success responses instead of treating them as successful.
-- Replaces the fixed-window visit limiter with a bounded token bucket.
-- Prevents the rate-limit cache from growing beyond its configured maximum.
-- Allows supporter writes to continue during slow supporter-list reads.
-- Prevents an older list response from overwriting cache data after a mutation.
-- Adds a matching Supabase index for rolling visit-cooldown lookups.
-- Retries idempotent visit-delivery status updates after transient Supabase failures.
-- Handles oversized streamed request bodies that omit `Content-Length`.
-- Configures Telegram webhook and command metadata concurrently during startup.
-- Reduces Docker build context and avoids generating Python bytecode in the image.
-- Removes generated caches and bytecode from the downloadable archive.
+- Adds a Telegram supporter-management panel with inline buttons.
+- Adds `➕ Add supporter` and `📋 Supporter list` buttons through `/manage`.
+- Adds paginated supporter lists with visible/hidden status.
+- Adds per-supporter `✏️ Update` and `🗑 Delete` buttons.
+- Adds delete confirmation before removing a supporter.
+- Adds guided add and update reply workflows with a 10-minute action timeout.
+- Adds `/list`, `/supporters`, `/manage`, and `/cancel` commands.
+- Supports partial updates such as `name=... | amount=... | payment=...`.
+- Supports clearing optional fields with `message=none`, `avatar=none`, or `payment=none`.
+- Keeps all management actions restricted to the configured chat and administrators.
+- Configures Telegram to deliver both `message` and `callback_query` webhook updates.
+- Keeps the existing secure and idempotent `/add` command.
+- Includes all reliability, security, cache, retry, and Supabase fixes from version 1.3.2.
+
+## Telegram supporter manager
+
+Open the manager with:
+
+```text
+/manage
+```
+
+The bot displays these buttons:
+
+- `➕ Add supporter`: starts a guided reply for supporter details.
+- `📋 Supporter list`: shows supporters five at a time.
+- `✏️ Update`: starts a guided partial-update reply for the selected supporter.
+- `🗑 Delete`: opens a confirmation screen before deletion.
+- `⬅️ Previous` and `Next ➡️`: navigate long supporter lists.
+- `🔄 Refresh`: reloads the current page.
+
+You can also open the list directly:
+
+```text
+/list
+/supporters
+```
+
+To update a supporter after pressing `✏️ Update`, reply with only the fields that
+should change:
+
+```text
+name=New Name | amount=20 | currency=USD | payment=ABA
+```
+
+Available update fields:
+
+```text
+name, amount, currency, message, avatar, payment, visible
+```
+
+Examples:
+
+```text
+message=Thank you for your support
+avatar=https://example.com/avatar.jpg
+payment=none
+visible=false
+```
+
+Use `/cancel` to cancel an active add or update action. Pending actions expire
+automatically after 10 minutes.
+
+After upgrading, redeploy with `TELEGRAM_AUTO_CONFIGURE_WEBHOOK=true`, or run:
+
+```bash
+python scripts/configure_telegram.py
+```
+
+This is required once so Telegram starts sending `callback_query` updates for the
+new buttons. No database migration is required when upgrading from version 1.3.2.
 
 ## Telegram `/add` command
 
@@ -61,9 +109,11 @@ The command is accepted only when:
 
 For group chats, `TELEGRAM_ADMIN_USER_IDS` is mandatory.
 
-## Upgrade from the previous version
+## Upgrade notes
 
-For the fastest fix, run `supabase_migration_v1_3_2.sql` once in the Supabase SQL Editor. It replaces the partial Telegram update index with a normal unique index so PostgREST can use:
+Upgrading from version 1.3.2 to 1.4.0 does not require a database migration. Redeploy the backend so the webhook is reconfigured to accept button callback updates.
+
+For versions older than 1.3.2, run `supabase_migration_v1_3_2.sql` once in the Supabase SQL Editor. It replaces the partial Telegram update index with a normal unique index so PostgREST can use:
 
 ```text
 on_conflict=telegram_update_id
@@ -136,4 +186,4 @@ Do not add an optional variable unless its default behavior needs to change.
 
 ## Validation
 
-The included regression suite covers application startup, request-body limits, proxy parsing, supporter validation, Telegram command parsing and retries, supporter cache concurrency, visit delivery retries, and bounded token-bucket rate limiting.
+The included regression suite covers application startup, request-body limits, proxy parsing, supporter validation, Telegram add/list/update/delete button workflows, callback authorization, webhook configuration, retries, supporter cache concurrency, visit delivery retries, and bounded token-bucket rate limiting. The current suite contains 43 tests.

@@ -21,7 +21,7 @@ from app.services.visit_crypto import VisitCryptoService
 from app.services.visits import VisitService
 
 
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.4.0"
 logger = logging.getLogger("app.main")
 
 

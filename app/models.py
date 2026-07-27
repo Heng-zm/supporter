@@ -271,9 +271,19 @@ class TelegramMessage(BaseModel):
     text: str | None = None
 
 
+class TelegramCallbackQuery(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    from_user: TelegramUser = Field(alias="from")
+    message: TelegramMessage | None = None
+    data: str | None = None
+
+
 class TelegramUpdate(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     update_id: int
     message: TelegramMessage | None = None
     edited_message: TelegramMessage | None = None
+    callback_query: TelegramCallbackQuery | None = None
