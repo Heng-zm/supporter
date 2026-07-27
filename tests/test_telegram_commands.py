@@ -23,6 +23,33 @@ def test_parse_full_add_command() -> None:
     assert parsed.supporter.payment_method == "Card"
 
 
+def test_parse_add_command_accepts_avatar_when_message_is_omitted() -> None:
+    parsed = parse_add_command(
+        "/add Chuo Kimheng | 1.00 | USD |\n"
+        "https://pay-coffee-topaz.vercel.app/favicon.ico | ABA"
+    )
+    assert parsed.supporter.name == "Chuo Kimheng"
+    assert parsed.supporter.amount == Decimal("1.00")
+    assert parsed.supporter.currency == "USD"
+    assert parsed.supporter.message is None
+    assert parsed.supporter.avatar_url == (
+        "https://pay-coffee-topaz.vercel.app/favicon.ico"
+    )
+    assert parsed.supporter.payment_method == "ABA"
+
+
+def test_parse_add_command_accepts_explicit_empty_message() -> None:
+    parsed = parse_add_command(
+        "/add Chuo Kimheng | 1.00 | USD | | "
+        "https://pay-coffee-topaz.vercel.app/favicon.ico | ABA"
+    )
+    assert parsed.supporter.message is None
+    assert parsed.supporter.avatar_url == (
+        "https://pay-coffee-topaz.vercel.app/favicon.ico"
+    )
+    assert parsed.supporter.payment_method == "ABA"
+
+
 def test_parse_add_command_requires_separator() -> None:
     with pytest.raises(ValueError, match="Use \\|"):
         parse_add_command("/add John 25")

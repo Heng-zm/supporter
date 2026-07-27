@@ -20,7 +20,9 @@ ADD_USAGE = (
     "<b>Add supporter</b>\n"
     "<code>/add Name | Amount | Currency | Message | Avatar URL | Payment method</code>\n\n"
     "Only name and amount are required. Currency defaults to USD.\n"
-    "Example: <code>/add John Doe | 25.00 | USD | Thank you!</code>"
+    "Basic: <code>/add John Doe | 25.00</code>\n"
+    "With avatar: <code>/add John Doe | 25.00 | USD | https://example.com/avatar.jpg | ABA</code>\n"
+    "To leave a field empty explicitly, use two separators: <code>| |</code>."
 )
 
 
@@ -73,6 +75,10 @@ def _parse_amount(value: str) -> Decimal:
         raise ValueError("Amount must be a valid number.") from exc
 
 
+def _looks_like_http_url(value: str) -> bool:
+    return value.strip().lower().startswith(("http://", "https://"))
+
+
 def parse_add_command(text: str) -> ParsedAddCommand:
     command_parts = text.strip().split(maxsplit=1)
     command = command_parts[0] if command_parts else ""
@@ -88,9 +94,20 @@ def parse_add_command(text: str) -> ParsedAddCommand:
     name = parts[0]
     amount = _parse_amount(parts[1])
     currency = parts[2] if len(parts) > 2 and parts[2] else "USD"
-    message = parts[3] if len(parts) > 3 and parts[3] else None
-    avatar_url = parts[4] if len(parts) > 4 and parts[4] else None
-    payment_method = parts[5] if len(parts) > 5 and parts[5] else None
+
+    # Friendly shorthand: when the fourth field is an HTTP(S) URL, treat it
+    # as the avatar and consider the optional message omitted. This accepts:
+    # /add Name | 1.00 | USD | https://example.com/avatar.jpg | ABA
+    # The full positional form with an explicit empty message ("| |") still
+    # works and remains unambiguous.
+    if len(parts) in {4, 5} and _looks_like_http_url(parts[3]):
+        message = None
+        avatar_url = parts[3]
+        payment_method = parts[4] if len(parts) > 4 and parts[4] else None
+    else:
+        message = parts[3] if len(parts) > 3 and parts[3] else None
+        avatar_url = parts[4] if len(parts) > 4 and parts[4] else None
+        payment_method = parts[5] if len(parts) > 5 and parts[5] else None
 
     try:
         supporter = SupporterCreate(

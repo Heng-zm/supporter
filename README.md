@@ -2,8 +2,10 @@
 
 FastAPI backend for supporter management, encrypted visit alerts, Supabase storage, and Telegram administration.
 
-## Version 1.3.0 improvements
+## Version 1.3.1 improvements
 
+- Fixes Telegram `/add` parsing when the optional message is omitted before an avatar URL.
+- Supports multiline `/add` commands and preserves explicit empty optional fields.
 - Adds a secure Telegram `/add` command through a webhook.
 - Prevents unexpected command failures from suppressing Telegram webhook retries.
 - Keeps Telegram supporter creation idempotent across retries and restarts.
@@ -35,13 +37,15 @@ Full form:
 /add Name | Amount | Currency | Message | Avatar URL | Payment method
 ```
 
-Example:
+Examples:
 
 ```text
 /add Jane Doe | 1,250.50 | USD | Thank you! | https://example.com/avatar.jpg | ABA
+/add Chuo Kimheng | 1.00 | USD | https://pay-coffee-topaz.vercel.app/favicon.ico | ABA
+/add Chuo Kimheng | 1.00 | USD | | https://pay-coffee-topaz.vercel.app/favicon.ico | ABA
 ```
 
-Only `Name` and `Amount` are required. Currency defaults to `USD`. Empty optional fields can be left between separators.
+Only `Name` and `Amount` are required. Currency defaults to `USD`. When the fourth field starts with `http://` or `https://`, it is automatically treated as the avatar URL and the message is considered omitted. You can also leave optional fields empty explicitly between two separators (`| |`).
 
 The command is accepted only when:
 
