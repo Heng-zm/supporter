@@ -10,7 +10,9 @@ from collections.abc import Iterable
 def secure_equals(left: str, right: str) -> bool:
     if not left or not right:
         return False
-    return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
+    left_digest = hashlib.sha256(left.encode("utf-8")).digest()
+    right_digest = hashlib.sha256(right.encode("utf-8")).digest()
+    return hmac.compare_digest(left_digest, right_digest)
 
 
 def sha256_text(value: str) -> str:

@@ -60,11 +60,11 @@ class TelegramService:
         for attempt in range(attempts):
             try:
                 response = await self.client.post(url, json=payload)
-            except httpx.HTTPError as exc:
+            except httpx.HTTPError:
                 if attempt + 1 < attempts:
                     await asyncio.sleep(0.2 * (2**attempt))
                     continue
-                return TelegramResult(ok=False, error=str(exc))
+                return TelegramResult(ok=False, error="Unable to reach Telegram.")
 
             try:
                 decoded = response.json() if response.content else {}
@@ -219,6 +219,7 @@ class TelegramService:
                 "secret_token": self.settings.telegram_webhook_secret,
                 "allowed_updates": ["message", "callback_query"],
                 "drop_pending_updates": False,
+                "max_connections": self.settings.telegram_webhook_max_connections,
             },
             retry_safe=True,
         )

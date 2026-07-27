@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import ValidationError
 
-from app.dependencies import get_visit_crypto, get_visit_service
+from app.dependencies import get_visit_crypto, get_visit_service, require_json_content_type
 from app.models import VisitPayload, VisitResponse
 from app.services.visit_crypto import ENCRYPTION_NAME, VisitCryptoService
 from app.services.visits import VisitRateLimitError, VisitService
 
 
+logger = logging.getLogger("app.visits")
 router = APIRouter(prefix="/website", tags=["visits"])
 
 
@@ -25,7 +27,7 @@ async def website_visit_public_key(
             detail="Visit encryption is not configured.",
         )
     response.headers["Cache-Control"] = "public, max-age=3600"
-    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Vary"] = "Origin"
     return {
         "ok": True,
         "algorithm": ENCRYPTION_NAME,
@@ -33,7 +35,11 @@ async def website_visit_public_key(
     }
 
 
-@router.post("/visit", response_model=VisitResponse)
+@router.post(
+    "/visit",
+    response_model=VisitResponse,
+    dependencies=[Depends(require_json_content_type)],
+)
 async def website_visit(
     request: Request,
     response: Response,
@@ -42,7 +48,6 @@ async def website_visit(
     crypto: VisitCryptoService = Depends(get_visit_crypto),
 ) -> VisitResponse:
     response.headers["Cache-Control"] = "no-store, max-age=0"
-    response.headers["X-Content-Type-Options"] = "nosniff"
 
     try:
         await visits.enforce_rate_limit(request)
@@ -76,9 +81,15 @@ async def website_visit(
             detail="Invalid visit payload.",
         ) from exc
     except RuntimeError as exc:
+        request_id = getattr(request.state, "request_id", "unknown")
+        logger.warning(
+            "Visit service unavailable: request_id=%s",
+            request_id,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=str(exc),
+            detail="Visit service is temporarily unavailable.",
         ) from exc
 
     return VisitResponse(

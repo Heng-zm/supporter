@@ -25,3 +25,26 @@ def test_supporter_update_allows_clearing_nullable_fields() -> None:
         "avatar_url": None,
         "payment_method": None,
     }
+
+
+def test_avatar_url_requires_public_https() -> None:
+    supporter = SupporterCreate(
+        name="Alice",
+        amount="1.00",
+        avatar_url="https://example.com/avatar.png",
+    )
+    assert supporter.avatar_url == "https://example.com/avatar.png"
+
+    with pytest.raises(ValidationError):
+        SupporterCreate(
+            name="Alice",
+            amount="1.00",
+            avatar_url="http://example.com/avatar.png",
+        )
+
+    with pytest.raises(ValidationError):
+        SupporterCreate(
+            name="Alice",
+            amount="1.00",
+            avatar_url="https://127.0.0.1/avatar.png",
+        )

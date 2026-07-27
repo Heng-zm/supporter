@@ -44,7 +44,10 @@ def test_production_rejects_malformed_required_encryption_key() -> None:
         visit_hash_salt="a-secure-production-visit-salt-123",
         visit_private_key_b64="not-valid-base64",
         require_encrypted_visits=True,
+        visit_alert_enabled=False,
         trust_proxy_headers=False,
+        backend_cors_origins_raw="https://frontend.example.com",
+        allowed_hosts_raw="api.example.com",
     )
     app = create_app(settings)
     try:

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import ipaddress
+import unicodedata
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
+from urllib.parse import urlparse
 from uuid import UUID
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -11,10 +14,20 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 MAX_SUPPORTER_AMOUNT = Decimal("1000000000")
 
 
+def _clean_text(value: Any) -> str:
+    normalized = unicodedata.normalize("NFC", str(value))
+    cleaned = "".join(
+        " " if character in "\r\n\t" else character
+        for character in normalized
+        if ord(character) >= 32 and ord(character) != 127
+    )
+    return " ".join(cleaned.split())
+
+
 def _normalize_optional_text(value: Any) -> str | None:
     if value is None:
         return None
-    text = str(value).strip()
+    text = _clean_text(value)
     return text or None
 
 
@@ -22,8 +35,22 @@ def _validate_avatar_url(value: str | None) -> str | None:
     value = _normalize_optional_text(value)
     if value is None:
         return None
-    if not value.startswith(("http://", "https://")):
-        raise ValueError("Avatar URL must begin with http:// or https://.")
+
+    parsed = urlparse(value)
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        raise ValueError("Avatar URL must use https://.")
+    if parsed.username or parsed.password or parsed.fragment:
+        raise ValueError("Avatar URL must not contain credentials or a fragment.")
+
+    hostname = parsed.hostname.rstrip(".").lower()
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        raise ValueError("Avatar URL must use a public host.")
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        address = None
+    if address is not None and not address.is_global:
+        raise ValueError("Avatar URL must use a public host.")
     return value
 
 
@@ -54,7 +81,7 @@ class SupporterBase(BaseModel):
     def strip_required_name(cls, value: Any) -> str:
         if value is None:
             raise ValueError("Name is required.")
-        return str(value).strip()
+        return _clean_text(value)
 
     @field_validator("message", "payment_method", mode="before")
     @classmethod
@@ -111,7 +138,7 @@ class SupporterUpdate(BaseModel):
     def strip_name(cls, value: Any) -> Any:
         if value is None:
             return None
-        return str(value).strip()
+        return _clean_text(value)
 
     @field_validator("message", "payment_method", mode="before")
     @classmethod
@@ -249,41 +276,42 @@ class VisitResponse(BaseModel):
 class TelegramUser(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    id: int
+    id: int = Field(ge=1, le=2**63 - 1)
     is_bot: bool = False
-    first_name: str = ""
-    username: str | None = None
+    first_name: str = Field(default="", max_length=256)
+    username: str | None = Field(default=None, max_length=64)
 
 
 class TelegramChat(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    id: int
-    type: str = "private"
+    id: int = Field(ge=-(2**63), le=2**63 - 1)
+    type: str = Field(default="private", max_length=32)
 
 
 class TelegramMessage(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    message_id: int
+    message_id: int = Field(ge=0, le=2**63 - 1)
     from_user: TelegramUser | None = Field(default=None, alias="from")
     chat: TelegramChat
-    text: str | None = None
+    date: int | None = Field(default=None, ge=0, le=2**63 - 1)
+    text: str | None = Field(default=None, max_length=8192)
 
 
 class TelegramCallbackQuery(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    id: str
+    id: str = Field(min_length=1, max_length=256)
     from_user: TelegramUser = Field(alias="from")
     message: TelegramMessage | None = None
-    data: str | None = None
+    data: str | None = Field(default=None, max_length=256)
 
 
 class TelegramUpdate(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    update_id: int
+    update_id: int = Field(ge=0, le=2**63 - 1)
     message: TelegramMessage | None = None
     edited_message: TelegramMessage | None = None
     callback_query: TelegramCallbackQuery | None = None

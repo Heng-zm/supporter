@@ -32,7 +32,7 @@ PENDING_ACTION_TTL_SECONDS = 10 * 60
 
 ADD_USAGE = (
     "<b>Add supporter</b>\n"
-    "<code>/add Name | Amount | Currency | Message | Avatar URL | Payment method</code>\n\n"
+    "<code>/add Name | Amount | Currency | Message | HTTPS Avatar URL | Payment method</code>\n\n"
     "Only name and amount are required. Currency defaults to USD.\n"
     "Basic: <code>/add John Doe | 25.00</code>\n"
     "With avatar: <code>/add John Doe | 25.00 | USD | "
@@ -568,6 +568,12 @@ class TelegramCommandService:
             await self._reply(message, _database_error_message(exc))
             return False
 
+        logger.info(
+            "Telegram admin created supporter: update_id=%s admin_user_id=%s supporter_id=%s",
+            update.update_id,
+            message.from_user.id if message.from_user else "unknown",
+            created.get("id", "unknown"),
+        )
         await self._reply(
             message,
             self._created_message(created, parsed.supporter),
@@ -635,6 +641,12 @@ class TelegramCommandService:
                     reply_markup=_menu_keyboard(),
                 )
                 return
+            logger.info(
+                "Telegram admin updated supporter: update_id=%s admin_user_id=%s supporter_id=%s",
+                update.update_id,
+                sender.id,
+                pending.supporter_id,
+            )
             await self._reply(
                 message,
                 "✅ <b>Supporter updated</b>\n"
@@ -874,7 +886,7 @@ class TelegramCommandService:
             "currency": "Choose USD/KHR below, or reply with a 3-letter currency code.",
             "message": "Reply with a short message, or press Skip/Clear.",
             "avatar_url": (
-                "Reply with an avatar URL beginning with http:// or https://, "
+                "Reply with an avatar URL beginning with https://, "
                 "or press Skip/Clear."
             ),
             "payment_method": (
@@ -1040,6 +1052,12 @@ class TelegramCommandService:
                 )
                 await self.telegram.send_message(chat_id, _database_error_message(exc))
                 return
+            logger.info(
+                "Telegram admin created supporter: update_id=%s admin_user_id=%s supporter_id=%s",
+                update_id,
+                user_id,
+                created.get("id", "unknown"),
+            )
             await self.pending_actions.clear(chat_id, user_id)
             await self.telegram.send_message(
                 chat_id,
@@ -1107,6 +1125,12 @@ class TelegramCommandService:
             )
             return
 
+        logger.info(
+            "Telegram admin updated supporter: update_id=%s admin_user_id=%s supporter_id=%s",
+            update_id,
+            user_id,
+            action.supporter_id,
+        )
         await self.pending_actions.clear(chat_id, user_id)
         await self.telegram.send_message(
             chat_id,
@@ -1464,6 +1488,13 @@ class TelegramCommandService:
                     show_alert=True,
                 )
             else:
+                logger.info(
+                    "Telegram admin deleted supporter: update_id=%s "
+                    "admin_user_id=%s supporter_id=%s",
+                    update_id,
+                    callback.from_user.id,
+                    supporter_id,
+                )
                 await self.telegram.answer_callback_query(callback.id, "Supporter deleted.")
             text, keyboard = await self._supporter_list_view(page)
             await self.telegram.edit_message_text(

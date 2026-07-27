@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import logging
 from decimal import Decimal
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
 from app.config import Settings
-from app.dependencies import get_app_settings, get_supabase, require_admin
+from app.dependencies import (
+    get_app_settings,
+    get_supabase,
+    require_admin,
+    require_json_content_type,
+)
 from app.models import (
     DeleteResponse,
     SupporterCreate,
@@ -18,6 +24,7 @@ from app.models import (
 from app.services.supabase import SupabaseError, SupabaseService
 
 
+logger = logging.getLogger("app.supporters")
 router = APIRouter(prefix="/supporters", tags=["supporters"])
 
 
@@ -66,28 +73,48 @@ async def list_supporters(
     return SupportersResponse(supporters=rows, source=source, stale=stale)
 
 
-@router.post("", response_model=SupporterResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=SupporterResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_json_content_type)],
+)
 async def create_supporter(
+    request: Request,
+    response: Response,
     payload: SupporterCreate,
     _: None = Depends(require_admin),
     supabase: SupabaseService = Depends(get_supabase),
 ) -> SupporterResponse:
+    response.headers["Cache-Control"] = "no-store, max-age=0"
     if not supabase.enabled:
         raise HTTPException(status_code=503, detail="Supabase is not configured.")
     try:
         row = await supabase.create_supporter(_json_row(payload))
+        logger.info(
+            "Supporter created through REST admin API: request_id=%s supporter_id=%s",
+            getattr(request.state, "request_id", "unknown"),
+            row.get("id", "unknown"),
+        )
         return SupporterResponse(supporter=row)
     except SupabaseError as exc:
         raise _provider_error() from exc
 
 
-@router.patch("/{supporter_id}", response_model=SupporterResponse)
+@router.patch(
+    "/{supporter_id}",
+    response_model=SupporterResponse,
+    dependencies=[Depends(require_json_content_type)],
+)
 async def update_supporter(
     supporter_id: UUID,
+    request: Request,
+    response: Response,
     payload: SupporterUpdate,
     _: None = Depends(require_admin),
     supabase: SupabaseService = Depends(get_supabase),
 ) -> SupporterResponse:
+    response.headers["Cache-Control"] = "no-store, max-age=0"
     if not supabase.enabled:
         raise HTTPException(status_code=503, detail="Supabase is not configured.")
     try:
@@ -96,15 +123,23 @@ async def update_supporter(
         raise _provider_error() from exc
     if row is None:
         raise HTTPException(status_code=404, detail="Supporter not found.")
+    logger.info(
+        "Supporter updated through REST admin API: request_id=%s supporter_id=%s",
+        getattr(request.state, "request_id", "unknown"),
+        supporter_id,
+    )
     return SupporterResponse(supporter=row)
 
 
 @router.delete("/{supporter_id}", response_model=DeleteResponse)
 async def delete_supporter(
     supporter_id: UUID,
+    request: Request,
+    response: Response,
     _: None = Depends(require_admin),
     supabase: SupabaseService = Depends(get_supabase),
 ) -> DeleteResponse:
+    response.headers["Cache-Control"] = "no-store, max-age=0"
     if not supabase.enabled:
         raise HTTPException(status_code=503, detail="Supabase is not configured.")
     try:
@@ -113,4 +148,9 @@ async def delete_supporter(
         raise _provider_error() from exc
     if not deleted:
         raise HTTPException(status_code=404, detail="Supporter not found.")
+    logger.info(
+        "Supporter deleted through REST admin API: request_id=%s supporter_id=%s",
+        getattr(request.state, "request_id", "unknown"),
+        supporter_id,
+    )
     return DeleteResponse()

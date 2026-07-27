@@ -106,3 +106,21 @@ async def test_send_message_includes_inline_keyboard() -> None:
 
     assert result.ok is True
     assert payloads[0]["reply_markup"] == keyboard
+
+async def test_network_error_does_not_leak_bot_token() -> None:
+    token = "123456:abcdefghijklmnopqrstuvwxyzABCDE"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(f"failed to connect to {request.url}", request=request)
+
+    settings = Settings(
+        telegram_bot_token=token,
+        require_encrypted_visits=False,
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        service = TelegramService(settings, client)
+        result = await service.send_message("123", "hello")
+
+    assert result.ok is False
+    assert result.error == "Unable to reach Telegram."
+    assert token not in (result.error or "")

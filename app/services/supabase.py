@@ -132,14 +132,23 @@ class SupabaseService:
                         error_detail,
                     )
 
-                logger.warning(
-                    "Supabase request failed: method=%s table=%s status=%s code=%s detail=%s",
-                    method.upper(),
-                    table,
-                    response.status_code,
-                    error_code or "unknown",
-                    error_detail[:500],
-                )
+                if self.settings.is_production:
+                    logger.warning(
+                        "Supabase request failed: method=%s table=%s status=%s code=%s",
+                        method.upper(),
+                        table,
+                        response.status_code,
+                        error_code or "unknown",
+                    )
+                else:
+                    logger.warning(
+                        "Supabase request failed: method=%s table=%s status=%s code=%s detail=%s",
+                        method.upper(),
+                        table,
+                        response.status_code,
+                        error_code or "unknown",
+                        error_detail[:500],
+                    )
                 raise SupabaseError(
                     f"Supabase returned {response.status_code}: {error_detail}",
                     status_code=response.status_code,

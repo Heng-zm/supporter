@@ -2,20 +2,61 @@ from __future__ import annotations
 
 import asyncio
 import heapq
-import math
 import time
-from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import Request
 
 from app.config import Settings
 from app.models import VisitPayload
+from app.services.rate_limit import TokenBucketRateLimiter
 from app.services.supabase import SupabaseError, SupabaseService
 from app.services.telegram import TelegramResult, TelegramService
-from app.utils.security import ip_is_trusted, mask_ip, parse_ip, random_id, sha256_text
+from app.utils.network import client_ip, proxy_is_trusted
+from app.utils.security import mask_ip, random_id, sha256_text
+
+
+def _sanitize_url(value: str, *, keep_query: bool) -> str:
+    text = str(value or "").strip()[:1500]
+    if not text or text == "Direct visit":
+        return text
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        return ""
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        return ""
+
+    host = parsed.hostname
+    try:
+        port = parsed.port
+    except ValueError:
+        return ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    if port is not None:
+        host = f"{host}:{port}"
+    return urlunsplit(
+        (
+            parsed.scheme.lower(),
+            host,
+            parsed.path or "/",
+            parsed.query if keep_query else "",
+            "",
+        )
+    )
+
+
+def _clean_field(value: str, maximum: int) -> str:
+    text = "".join(
+        " " if character in "\r\n\t" else character
+        for character in str(value or "")
+        if ord(character) >= 32 and ord(character) != 127
+    )
+    return " ".join(text.split())[:maximum]
 
 
 class VisitRateLimitError(RuntimeError):
@@ -67,34 +108,6 @@ class ExpiringReservationCache:
             self._items.pop(key, None)
 
 
-class TokenBucketRateLimiter:
-    def __init__(self, max_items: int = 10000) -> None:
-        self.max_items = max_items
-        self._items: OrderedDict[str, tuple[float, float]] = OrderedDict()
-        self._lock = asyncio.Lock()
-
-    async def check(self, key: str, limit: int, window_seconds: int = 60) -> int | None:
-        now = time.monotonic()
-        refill_rate = limit / window_seconds
-
-        async with self._lock:
-            tokens, updated_at = self._items.get(key, (float(limit), now))
-            tokens = min(float(limit), tokens + max(0.0, now - updated_at) * refill_rate)
-
-            if tokens >= 1.0:
-                tokens -= 1.0
-                retry_after = None
-            else:
-                retry_after = max(1, math.ceil((1.0 - tokens) / refill_rate))
-
-            self._items[key] = (tokens, now)
-            self._items.move_to_end(key)
-            while len(self._items) > self.max_items:
-                self._items.popitem(last=False)
-
-            return retry_after
-
-
 @dataclass(slots=True)
 class VisitProcessResult:
     duplicate: bool
@@ -115,32 +128,11 @@ class VisitService:
         self.cache = ExpiringReservationCache()
         self.rate_limiter = TokenBucketRateLimiter()
 
-    def _peer_ip(self, request: Request) -> str:
-        return request.client.host if request.client else "unknown"
-
     def _proxy_is_trusted(self, request: Request) -> bool:
-        return bool(
-            self.settings.trust_proxy_headers
-            and ip_is_trusted(self._peer_ip(request), self.settings.trusted_proxy_networks)
-        )
+        return proxy_is_trusted(request, self.settings)
 
     def _client_ip(self, request: Request) -> str:
-        peer_ip = self._peer_ip(request)
-        if not self._proxy_is_trusted(request):
-            return peer_ip
-
-        forwarded = request.headers.get("x-forwarded-for", "")
-        chain = [
-            address.compressed
-            for item in forwarded.split(",")
-            if (address := parse_ip(item)) is not None
-        ]
-        chain.append(peer_ip)
-
-        for candidate in reversed(chain):
-            if not ip_is_trusted(candidate, self.settings.trusted_proxy_networks):
-                return candidate
-        return chain[0] if chain else peer_ip
+        return client_ip(request, self.settings)
 
     def _location(self, request: Request) -> tuple[str, str | None, str | None, str | None]:
         if not self._proxy_is_trusted(request):
@@ -167,8 +159,19 @@ class VisitService:
         payload: VisitPayload,
     ) -> tuple[dict[str, Any], dict[str, Any], str, str]:
         now = datetime.now(timezone.utc)
+        server_timestamp = now.isoformat()
         ip = self._client_ip(request)
-        user_agent = request.headers.get("user-agent", "Unknown").strip()[:1000] or "Unknown"
+        user_agent = _clean_field(request.headers.get("user-agent", "Unknown"), 1000) or "Unknown"
+        visit_url = _sanitize_url(
+            payload.url,
+            keep_query=self.settings.visit_store_url_query,
+        )
+        referrer = _sanitize_url(
+            payload.referrer,
+            keep_query=self.settings.visit_store_url_query,
+        ) or "Direct visit"
+        path = urlsplit(visit_url).path if visit_url else str(payload.path or "/").split("?", 1)[0]
+        path = path[:500] if path.startswith("/") else "/"
         cooldown_seconds = self.settings.visit_alert_cooldown_minutes * 60
         bucket = int(now.timestamp()) // cooldown_seconds
         ip_hash = sha256_text(f"{self.settings.visit_hash_salt}:{ip}")
@@ -180,18 +183,18 @@ class VisitService:
         viewport = f"{screen.get('viewportWidth', 0)}x{screen.get('viewportHeight', 0)}"
 
         public_visit = {
-            "event_id": payload.eventId or random_id(),
-            "timestamp": payload.timestamp or now.isoformat(),
-            "local_time": payload.localTime or now.isoformat(),
-            "url": payload.url,
-            "path": payload.path,
-            "referrer": payload.referrer,
-            "title": payload.title,
-            "device": payload.device,
-            "browser": payload.browser,
-            "platform": payload.platform,
-            "language": payload.language,
-            "timezone": payload.timezone,
+            "event_id": random_id(),
+            "timestamp": server_timestamp,
+            "local_time": _clean_field(payload.localTime or server_timestamp, 120),
+            "url": visit_url,
+            "path": path,
+            "referrer": referrer,
+            "title": _clean_field(payload.title, 300),
+            "device": _clean_field(payload.device, 120),
+            "browser": _clean_field(payload.browser, 160),
+            "platform": _clean_field(payload.platform, 160),
+            "language": _clean_field(payload.language, 40),
+            "timezone": _clean_field(payload.timezone, 100),
             "screen": screen,
             "connection": connection,
             "viewport": viewport,
@@ -203,16 +206,16 @@ class VisitService:
         row = {
             "event_id": public_visit["event_id"],
             "dedupe_key": database_dedupe_key,
-            "client_timestamp": public_visit["timestamp"],
-            "url": payload.url or None,
-            "path": payload.path,
-            "referrer": payload.referrer or None,
-            "title": payload.title or None,
-            "device": payload.device,
-            "browser": payload.browser,
-            "platform": payload.platform,
-            "language": payload.language,
-            "timezone": payload.timezone,
+            "client_timestamp": server_timestamp,
+            "url": visit_url or None,
+            "path": path,
+            "referrer": referrer if referrer != "Direct visit" else None,
+            "title": public_visit["title"] or None,
+            "device": public_visit["device"],
+            "browser": public_visit["browser"],
+            "platform": public_visit["platform"],
+            "language": public_visit["language"],
+            "timezone": public_visit["timezone"],
             "screen": screen,
             "connection": connection,
             "user_agent": user_agent,
