@@ -463,3 +463,127 @@ async def test_unauthorized_callback_does_not_access_database() -> None:
 
     assert telegram.edits == []
     assert telegram.callback_answers[-1] == ("callback-2007", "You are not authorized.", True)
+
+
+def _text_update(update_id: int, text: str, *, message_id: int | None = None):
+    from app.models import TelegramUpdate
+
+    return TelegramUpdate.model_validate(
+        {
+            "update_id": update_id,
+            "message": {
+                "message_id": message_id or update_id,
+                "from": {"id": 123, "is_bot": False, "first_name": "Admin"},
+                "chat": {"id": 123, "type": "private"},
+                "text": text,
+            },
+        }
+    )
+
+
+async def test_guided_add_asks_one_field_at_a_time_and_saves() -> None:
+    from app.services.telegram_commands import TelegramCommandService
+
+    supabase = FakeCommandSupabase()
+    telegram = FakeCommandTelegram()
+    service = TelegramCommandService(
+        _manager_settings(),
+        supabase,
+        telegram,  # type: ignore[arg-type]
+    )
+
+    await service.handle(_text_update(3001, "/add"))
+    assert "Step 1/7" in telegram.messages[-1][1]
+    assert "Name" in telegram.messages[-1][1]
+
+    await service.handle(_text_update(3002, "Chuo Kimheng"))
+    assert "Step 2/7" in telegram.messages[-1][1]
+
+    await service.handle(_text_update(3003, "1.00"))
+    assert "Step 3/7" in telegram.messages[-1][1]
+
+    await service.handle(_callback_update(3004, "sp:wizard:value:USD"))
+    await service.handle(_callback_update(3005, "sp:wizard:skip"))
+    await service.handle(
+        _text_update(3006, "https://pay-coffee-topaz.vercel.app/favicon.ico")
+    )
+    await service.handle(_callback_update(3007, "sp:wizard:value:ABA"))
+    await service.handle(_callback_update(3008, "sp:wizard:value:true"))
+
+    assert "Confirm information" in telegram.messages[-1][1]
+    await service.handle(_callback_update(3009, "sp:wizard:save"))
+
+    assert len(supabase.calls) == 1
+    row, update_id = supabase.calls[0]
+    assert update_id == 3009
+    assert row == {
+        "name": "Chuo Kimheng",
+        "amount": 1.0,
+        "currency": "USD",
+        "message": None,
+        "avatar_url": "https://pay-coffee-topaz.vercel.app/favicon.ico",
+        "payment_method": "ABA",
+        "is_visible": True,
+    }
+    assert "Supporter added" in telegram.messages[-1][1]
+
+
+async def test_guided_add_invalid_amount_stays_on_amount_step() -> None:
+    from app.services.telegram_commands import TelegramCommandService
+
+    service = TelegramCommandService(
+        _manager_settings(),
+        FakeCommandSupabase(),
+        FakeCommandTelegram(),  # type: ignore[arg-type]
+    )
+    telegram = service.telegram
+
+    await service.handle(_text_update(3101, "/add"))
+    await service.handle(_text_update(3102, "Alice"))
+    await service.handle(_text_update(3103, "one dollar"))
+
+    assert "valid en-US number" in telegram.messages[-1][1]  # type: ignore[attr-defined]
+    pending = await service.pending_actions.get(123, 123)
+    assert pending is not None
+    assert pending.step == "amount"
+
+
+async def test_guided_update_keep_clear_change_and_confirm() -> None:
+    from app.services.telegram_commands import TelegramCommandService
+
+    supabase = FakeManagerSupabase()
+    telegram = FakeCommandTelegram()
+    service = TelegramCommandService(
+        _manager_settings(),
+        supabase,
+        telegram,  # type: ignore[arg-type]
+    )
+    supporter_id = "11111111-1111-1111-1111-111111111111"
+
+    await service.handle(_callback_update(3201, f"sp:edit:{supporter_id}:0"))
+    assert "Step 1/7" in telegram.messages[-1][1]
+    assert "Keep current" in telegram.messages[-1][1]
+
+    await service.handle(_callback_update(3202, "sp:wizard:keep"))
+    await service.handle(_text_update(3203, "20.00"))
+    await service.handle(_callback_update(3204, "sp:wizard:keep"))
+    await service.handle(_callback_update(3205, "sp:wizard:clear"))
+    await service.handle(_callback_update(3206, "sp:wizard:keep"))
+    await service.handle(_text_update(3207, "Wing"))
+    await service.handle(_callback_update(3208, "sp:wizard:value:false"))
+
+    assert "Confirm information" in telegram.messages[-1][1]
+    await service.handle(_callback_update(3209, "sp:wizard:save"))
+
+    assert supabase.updated == [
+        (
+            supporter_id,
+            {
+                "amount": 20.0,
+                "message": None,
+                "payment_method": "Wing",
+                "is_visible": False,
+            },
+        )
+    ]
+    assert "Supporter updated" in telegram.messages[-1][1]

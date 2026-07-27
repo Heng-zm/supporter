@@ -4,7 +4,7 @@ import asyncio
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from html import escape
 from typing import Any, Literal
@@ -42,9 +42,11 @@ ADD_USAGE = (
 
 MANAGER_HELP = (
     "<b>Supporter manager</b>\n"
-    "Use the buttons below to add, list, update, or delete supporters.\n\n"
+    "Add and update supporters one question at a time.\n"
+    "បញ្ចូល និងកែប្រែព័ត៌មាន "
+    "មួយជំហានម្តង។\n\n"
     "Commands: <code>/manage</code>, <code>/list</code>, <code>/add</code>, "
-    "<code>/cancel</code>"
+    "<code>/back</code>, <code>/skip</code>, <code>/cancel</code>"
 )
 
 UPDATE_USAGE = (
@@ -66,6 +68,9 @@ class ParsedAddCommand:
 @dataclass(slots=True)
 class PendingAction:
     kind: Literal["add", "update"]
+    step: str = "name"
+    data: dict[str, Any] = field(default_factory=dict)
+    original: dict[str, Any] = field(default_factory=dict)
     supporter_id: str | None = None
     return_page: int = 0
 
@@ -341,6 +346,20 @@ def _parse_decimal(value: Any, fallback: Decimal = Decimal("0")) -> Decimal:
         return fallback
 
 
+ADD_WIZARD_STEPS = (
+    "name",
+    "amount",
+    "currency",
+    "message",
+    "avatar_url",
+    "payment_method",
+    "is_visible",
+    "confirm",
+)
+UPDATE_WIZARD_STEPS = ADD_WIZARD_STEPS
+OPTIONAL_FIELDS = {"message", "avatar_url", "payment_method"}
+
+
 class TelegramCommandService:
     def __init__(
         self,
@@ -394,7 +413,7 @@ class TelegramCommandService:
             if not await self.processed_updates.reserve(update.update_id):
                 return
             try:
-                await self._handle_callback(callback)
+                await self._handle_callback(update.update_id, callback)
             except Exception:
                 await self.processed_updates.release(update.update_id)
                 raise
@@ -414,6 +433,8 @@ class TelegramCommandService:
             "/list",
             "/supporters",
             "/cancel",
+            "/skip",
+            "/back",
         }
         sender = message.from_user
         pending = (
@@ -450,7 +471,13 @@ class TelegramCommandService:
 
         if command == "/cancel":
             await self.pending_actions.clear(message.chat.id, sender.id)
-            await self._reply(message, "✅ Current action cancelled.", reply_markup=_menu_keyboard())
+            await self._reply(
+                message,
+                "✅ Current action cancelled.\n"
+                "បានបោះបង់សកម្មភាព"
+                "បច្ចុប្បន្ន។",
+                reply_markup=_menu_keyboard(),
+            )
             return
 
         if command in {"/help", "/start", "/manage"}:
@@ -459,6 +486,7 @@ class TelegramCommandService:
             return
 
         if command in {"/list", "/supporters"}:
+            await self.pending_actions.clear(message.chat.id, sender.id)
             await self._send_supporter_list(message, page=0)
             return
 
@@ -467,25 +495,46 @@ class TelegramCommandService:
             if len(command_parts) == 1:
                 await self._begin_add(message, sender)
                 return
-            await self._create_from_add_text(update, message, message.text or "")
+            success = await self._create_from_add_text(update, message, message.text or "")
+            if success:
+                await self.pending_actions.clear(message.chat.id, sender.id)
             return
 
-        if pending is not None:
-            await self._handle_pending_input(update, message, sender, pending)
+        if pending is None:
+            if command in {"/skip", "/back"}:
+                await self._reply(
+                    message,
+                    "ℹ️ No active form. Send <code>/add</code> or open <code>/manage</code>.",
+                    reply_markup=_menu_keyboard(),
+                )
+            return
+
+        if command == "/back":
+            await self._wizard_back(message.chat.id, sender.id, pending, reply_to=message)
+            return
+        if command == "/skip":
+            await self._wizard_skip(message.chat.id, sender.id, pending, reply_to=message)
+            return
+
+        await self._handle_pending_input(update, message, sender, pending)
 
     async def _begin_add(self, message: TelegramMessage, sender: TelegramUser) -> None:
-        await self.pending_actions.set(
-            message.chat.id,
-            sender.id,
-            PendingAction(kind="add"),
+        action = PendingAction(
+            kind="add",
+            step="name",
+            data={
+                "currency": "USD",
+                "message": None,
+                "avatar_url": None,
+                "payment_method": None,
+                "is_visible": True,
+            },
         )
-        await self._reply(
-            message,
-            "➕ <b>Add supporter</b>\n"
-            "Reply with:\n"
-            "<code>Name | Amount | Currency | Message | Avatar URL | Payment method</code>\n\n"
-            "Only name and amount are required. Send <code>/cancel</code> to stop.",
-            reply_markup=_force_reply("Name | Amount | USD | Message | Avatar | ABA"),
+        await self.pending_actions.set(message.chat.id, sender.id, action)
+        await self._send_wizard_prompt(
+            message.chat.id,
+            action,
+            reply_to_message_id=message.message_id,
         )
 
     async def _create_from_add_text(
@@ -536,6 +585,7 @@ class TelegramCommandService:
         created_amount = _parse_decimal(created.get("amount"), fallback.amount)
         return (
             "✅ <b>Supporter added</b>\n"
+            "បានបន្ថែមអ្នកគាំទ្ររួចរាល់។\n\n"
             f"👤 <b>Name:</b> {created_name}\n"
             f"💵 <b>Amount:</b> {escape(_format_amount(created_amount, created_currency))}"
         )
@@ -547,24 +597,22 @@ class TelegramCommandService:
         sender: TelegramUser,
         pending: PendingAction,
     ) -> None:
-        text = message.text or ""
-        if pending.kind == "add":
-            success = await self._create_from_add_text(update, message, f"/add {text}")
-            if success:
-                await self.pending_actions.clear(message.chat.id, sender.id)
-            return
+        text = (message.text or "").strip()
+        lowered = text.lower()
 
-        if pending.kind == "update" and pending.supporter_id:
+        # Keep the previous compact name=value format for experienced admins.
+        # The default UI uses the guided wizard, but old commands continue to work.
+        if pending.kind == "update" and pending.supporter_id and "=" in text:
             try:
                 patch = parse_update_fields(text)
             except ValueError as exc:
                 await self._reply(
                     message,
-                    f"❌ {escape(str(exc))}\n\n{UPDATE_USAGE}\n\n"
-                    "Send <code>/cancel</code> to stop.",
+                    f"❌ {escape(str(exc))}\n\nContinue the guided form or send "
+                    "<code>/cancel</code> to stop.",
+                    reply_markup=self._wizard_keyboard(pending),
                 )
                 return
-
             try:
                 updated = await self.supabase.update_supporter(
                     pending.supporter_id,
@@ -572,24 +620,21 @@ class TelegramCommandService:
                 )
             except SupabaseError as exc:
                 logger.warning(
-                    "Telegram supporter update failed: id=%s status=%s code=%s",
+                    "Telegram supporter compact update failed: id=%s status=%s code=%s",
                     pending.supporter_id,
                     exc.status_code,
                     exc.code,
                 )
                 await self._reply(message, _database_error_message(exc))
                 return
-
+            await self.pending_actions.clear(message.chat.id, sender.id)
             if updated is None:
-                await self.pending_actions.clear(message.chat.id, sender.id)
                 await self._reply(
                     message,
                     "❌ Supporter not found. It may already have been deleted.",
                     reply_markup=_menu_keyboard(),
                 )
                 return
-
-            await self.pending_actions.clear(message.chat.id, sender.id)
             await self._reply(
                 message,
                 "✅ <b>Supporter updated</b>\n"
@@ -606,6 +651,480 @@ class TelegramCommandService:
                     ]
                 },
             )
+            return
+
+        if pending.step == "confirm":
+            if lowered in {"save", "yes", "confirm", "ok"}:
+                await self._save_wizard(
+                    update.update_id,
+                    message.chat.id,
+                    sender.id,
+                    pending,
+                    message,
+                )
+            elif lowered in {"back", "edit"}:
+                await self._wizard_back(message.chat.id, sender.id, pending, reply_to=message)
+            else:
+                await self._reply(
+                    message,
+                    "ℹ️ Press <b>Save</b> to confirm, or <b>Back</b> to edit.\n"
+                    "ចុច Save ដើម្បីរក្សាទុក ឬ Back "
+                    "ដើម្បីកែប្រែ។",
+                    reply_markup=self._wizard_keyboard(pending),
+                )
+            return
+
+        if lowered in {"back", "/back"}:
+            await self._wizard_back(message.chat.id, sender.id, pending, reply_to=message)
+            return
+
+        if lowered in {"skip", "/skip", "-"}:
+            await self._wizard_skip(message.chat.id, sender.id, pending, reply_to=message)
+            return
+
+        if pending.kind == "update" and lowered in {"keep", "same", "unchanged"}:
+            await self._advance_wizard(message.chat.id, sender.id, pending, reply_to=message)
+            return
+
+        if pending.kind == "update" and pending.step in OPTIONAL_FIELDS and lowered in {
+            "clear",
+            "none",
+            "null",
+        }:
+            pending.data[pending.step] = None
+            await self._advance_wizard(message.chat.id, sender.id, pending, reply_to=message)
+            return
+
+        try:
+            pending.data[pending.step] = self._parse_wizard_field(pending.step, text)
+        except ValueError as exc:
+            await self._reply(
+                message,
+                f"❌ {escape(str(exc))}\n\nPlease reply again. Send <code>/back</code> or "
+                "<code>/cancel</code> when needed.",
+                reply_markup=self._wizard_keyboard(pending),
+            )
+            return
+
+        await self._advance_wizard(message.chat.id, sender.id, pending, reply_to=message)
+
+    def _parse_wizard_field(self, field_name: str, text: str) -> Any:
+        value: Any = text.strip()
+        if field_name == "amount":
+            value = _parse_amount(value)
+        elif field_name == "is_visible":
+            normalized = value.lower()
+            if normalized in {"true", "yes", "1", "show", "visible", "public"}:
+                value = True
+            elif normalized in {"false", "no", "0", "hide", "hidden", "private"}:
+                value = False
+            else:
+                raise ValueError("Reply visible or hidden, or use the buttons.")
+
+        try:
+            validated = SupporterUpdate.model_validate({field_name: value})
+        except ValidationError as exc:
+            first_error = exc.errors()[0].get("msg", "Invalid value.")
+            raise ValueError(str(first_error).replace("Value error, ", "")) from exc
+        return getattr(validated, field_name)
+
+    async def _advance_wizard(
+        self,
+        chat_id: int,
+        user_id: int,
+        action: PendingAction,
+        *,
+        reply_to: TelegramMessage | None = None,
+    ) -> None:
+        steps = ADD_WIZARD_STEPS if action.kind == "add" else UPDATE_WIZARD_STEPS
+        try:
+            index = steps.index(action.step)
+        except ValueError:
+            index = 0
+        action.step = steps[min(index + 1, len(steps) - 1)]
+        await self.pending_actions.set(chat_id, user_id, action)
+        await self._send_wizard_prompt(
+            chat_id,
+            action,
+            reply_to_message_id=reply_to.message_id if reply_to else None,
+        )
+
+    async def _wizard_skip(
+        self,
+        chat_id: int,
+        user_id: int,
+        action: PendingAction,
+        *,
+        reply_to: TelegramMessage | None = None,
+    ) -> None:
+        if action.kind == "update":
+            await self._advance_wizard(chat_id, user_id, action, reply_to=reply_to)
+            return
+
+        defaults: dict[str, Any] = {
+            "currency": "USD",
+            "message": None,
+            "avatar_url": None,
+            "payment_method": None,
+            "is_visible": True,
+        }
+        if action.step not in defaults:
+            text = "❌ This field is required and cannot be skipped."
+            if reply_to:
+                await self._reply(reply_to, text, reply_markup=self._wizard_keyboard(action))
+            else:
+                await self.telegram.send_message(
+                    chat_id,
+                    text,
+                    reply_markup=self._wizard_keyboard(action),
+                )
+            return
+        action.data[action.step] = defaults[action.step]
+        await self._advance_wizard(chat_id, user_id, action, reply_to=reply_to)
+
+    async def _wizard_back(
+        self,
+        chat_id: int,
+        user_id: int,
+        action: PendingAction,
+        *,
+        reply_to: TelegramMessage | None = None,
+    ) -> None:
+        steps = ADD_WIZARD_STEPS if action.kind == "add" else UPDATE_WIZARD_STEPS
+        try:
+            index = steps.index(action.step)
+        except ValueError:
+            index = 0
+        if index <= 0:
+            await self.pending_actions.clear(chat_id, user_id)
+            if action.kind == "update":
+                text, keyboard = await self._supporter_list_view(action.return_page)
+                await self.telegram.send_message(chat_id, text, reply_markup=keyboard)
+            else:
+                await self.telegram.send_message(
+                    chat_id,
+                    MANAGER_HELP,
+                    reply_markup=_menu_keyboard(),
+                )
+            return
+        action.step = steps[index - 1]
+        await self.pending_actions.set(chat_id, user_id, action)
+        await self._send_wizard_prompt(
+            chat_id,
+            action,
+            reply_to_message_id=reply_to.message_id if reply_to else None,
+        )
+
+    async def _send_wizard_prompt(
+        self,
+        chat_id: int,
+        action: PendingAction,
+        *,
+        reply_to_message_id: int | None = None,
+    ) -> None:
+        await self.telegram.send_message(
+            chat_id,
+            self._wizard_prompt_text(action),
+            reply_to_message_id=reply_to_message_id,
+            reply_markup=self._wizard_keyboard(action),
+        )
+
+    def _wizard_prompt_text(self, action: PendingAction) -> str:
+        heading = (
+            "➕ <b>Add supporter</b>"
+            if action.kind == "add"
+            else "✏️ <b>Update supporter</b>"
+        )
+        if action.step == "confirm":
+            changed = ""
+            if action.kind == "update":
+                patch = self._wizard_update_patch(action)
+                changed = (
+                    "\n\nℹ️ No values changed yet. You may go Back or save without changes."
+                    if not patch
+                    else f"\n\n✏️ <b>Changed fields:</b> {escape(', '.join(patch))}"
+                )
+            return (
+                f"{heading}\n"
+                "✅ <b>Confirm information</b>\n"
+                "ពិនិត្យព័ត៌មានមុនរក្សាទុក។\n\n"
+                f"{self._wizard_summary(action.data)}{changed}"
+            )
+
+        steps = ADD_WIZARD_STEPS if action.kind == "add" else UPDATE_WIZARD_STEPS
+        number = steps.index(action.step) + 1
+        total = len(steps) - 1
+        current = ""
+        if action.kind == "update":
+            display_value = self._display_field_value(
+                action.step,
+                action.data.get(action.step),
+            )
+            current = f"\nCurrent: <code>{escape(display_value)}</code>"
+
+        prompts = {
+            "name": (
+                "Reply with the supporter name.\n"
+                "ឆ្លើយតបដោយឈ្មោះអ្នកគាំទ្រ។"
+            ),
+            "amount": (
+                "Reply with the amount, for example <code>1.00</code> "
+                "or <code>1,250.50</code>."
+            ),
+            "currency": "Choose USD/KHR below, or reply with a 3-letter currency code.",
+            "message": "Reply with a short message, or press Skip/Clear.",
+            "avatar_url": (
+                "Reply with an avatar URL beginning with http:// or https://, "
+                "or press Skip/Clear."
+            ),
+            "payment_method": (
+                "Choose a payment method below, reply with another method, "
+                "or press Skip/Clear."
+            ),
+            "is_visible": "Choose whether this supporter is visible on the public list.",
+        }
+        labels = {
+            "name": "Name / ឈ្មោះ",
+            "amount": "Amount / ចំនួនទឹកប្រាក់",
+            "currency": "Currency / រូបិយប័ណ្ណ",
+            "message": "Message / សារ",
+            "avatar_url": "Avatar URL / រូបភាព",
+            "payment_method": "Payment method / វិធីបង់ប្រាក់",
+            "is_visible": "Visibility / ការបង្ហាញ",
+        }
+        extra = (
+            "\nPress <b>Keep current</b> to leave it unchanged."
+            if action.kind == "update"
+            else ""
+        )
+        return (
+            f"{heading}\n"
+            f"<b>Step {number}/{total}: {labels[action.step]}</b>{current}\n\n"
+            f"{prompts[action.step]}{extra}\n\n"
+            "Commands: <code>/back</code> · <code>/skip</code> · <code>/cancel</code>"
+        )
+
+    def _wizard_keyboard(self, action: PendingAction) -> dict[str, Any]:
+        rows: list[list[dict[str, str]]] = []
+        step = action.step
+
+        if step == "confirm":
+            rows.append(
+                [
+                    {
+                        "text": "✅ Save / រក្សាទុក",
+                        "callback_data": "sp:wizard:save",
+                    },
+                    {
+                        "text": "⬅️ Back / ថយក្រោយ",
+                        "callback_data": "sp:wizard:back",
+                    },
+                ]
+            )
+            rows.append([{"text": "❌ Cancel", "callback_data": "sp:wizard:cancel"}])
+            return {"inline_keyboard": rows}
+
+        if step == "currency":
+            rows.append(
+                [
+                    {"text": "🇺🇸 USD", "callback_data": "sp:wizard:value:USD"},
+                    {"text": "🇰🇭 KHR", "callback_data": "sp:wizard:value:KHR"},
+                ]
+            )
+        elif step == "payment_method":
+            rows.append(
+                [
+                    {"text": "ABA", "callback_data": "sp:wizard:value:ABA"},
+                    {"text": "ACLEDA", "callback_data": "sp:wizard:value:ACLEDA"},
+                    {"text": "Cash", "callback_data": "sp:wizard:value:Cash"},
+                ]
+            )
+        elif step == "is_visible":
+            rows.append(
+                [
+                    {"text": "👁 Visible", "callback_data": "sp:wizard:value:true"},
+                    {"text": "🙈 Hidden", "callback_data": "sp:wizard:value:false"},
+                ]
+            )
+
+        if action.kind == "update":
+            field_buttons: list[dict[str, str]] = [
+                {"text": "➡️ Keep current", "callback_data": "sp:wizard:keep"}
+            ]
+            if step in OPTIONAL_FIELDS:
+                field_buttons.append({"text": "🧹 Clear", "callback_data": "sp:wizard:clear"})
+            rows.append(field_buttons)
+        elif step in {"currency", "message", "avatar_url", "payment_method", "is_visible"}:
+            rows.append([{"text": "⏭ Skip", "callback_data": "sp:wizard:skip"}])
+
+        rows.append(
+            [
+                {"text": "⬅️ Back", "callback_data": "sp:wizard:back"},
+                {"text": "❌ Cancel", "callback_data": "sp:wizard:cancel"},
+            ]
+        )
+        return {"inline_keyboard": rows}
+
+    def _wizard_summary(self, data: dict[str, Any]) -> str:
+        currency = str(data.get("currency") or "USD").upper()
+        amount = _parse_decimal(data.get("amount"))
+        visible = bool(data.get("is_visible", True))
+        return "\n".join(
+            [
+                f"👤 <b>Name:</b> {escape(str(data.get('name') or '—'))}",
+                f"💵 <b>Amount:</b> {escape(_format_amount(amount, currency))}",
+                f"💬 <b>Message:</b> {escape(str(data.get('message') or '—'))}",
+                f"🖼 <b>Avatar:</b> {escape(str(data.get('avatar_url') or '—'))}",
+                f"🏦 <b>Payment:</b> {escape(str(data.get('payment_method') or '—'))}",
+                f"{('👁' if visible else '🙈')} <b>Visible:</b> {'Yes' if visible else 'No'}",
+            ]
+        )
+
+    @staticmethod
+    def _display_field_value(field_name: str, value: Any) -> str:
+        if field_name == "amount" and value is not None:
+            return f"{_parse_decimal(value):,.2f}"
+        if field_name == "is_visible":
+            return "Visible" if bool(value) else "Hidden"
+        return str(value) if value not in {None, ""} else "—"
+
+    def _wizard_update_patch(self, action: PendingAction) -> dict[str, Any]:
+        patch: dict[str, Any] = {}
+        for field_name in (
+            "name",
+            "amount",
+            "currency",
+            "message",
+            "avatar_url",
+            "payment_method",
+            "is_visible",
+        ):
+            if action.data.get(field_name) != action.original.get(field_name):
+                patch[field_name] = action.data.get(field_name)
+        return patch
+
+    async def _save_wizard(
+        self,
+        update_id: int,
+        chat_id: int,
+        user_id: int,
+        action: PendingAction,
+        reply_to: TelegramMessage | None = None,
+    ) -> None:
+        if not self.supabase.enabled:
+            await self.telegram.send_message(chat_id, "❌ Supabase is not configured.")
+            return
+
+        if action.kind == "add":
+            try:
+                supporter = SupporterCreate.model_validate(action.data)
+            except ValidationError as exc:
+                first_error = exc.errors()[0].get("msg", "Invalid supporter data.")
+                await self.telegram.send_message(
+                    chat_id,
+                    f"❌ {escape(str(first_error).replace('Value error, ', ''))}",
+                    reply_markup=self._wizard_keyboard(action),
+                )
+                return
+            try:
+                created = await self.supabase.create_supporter_from_telegram(
+                    _supporter_row(supporter),
+                    update_id,
+                )
+            except SupabaseError as exc:
+                logger.warning(
+                    "Telegram supporter wizard add failed: update_id=%s status=%s code=%s",
+                    update_id,
+                    exc.status_code,
+                    exc.code,
+                )
+                await self.telegram.send_message(chat_id, _database_error_message(exc))
+                return
+            await self.pending_actions.clear(chat_id, user_id)
+            await self.telegram.send_message(
+                chat_id,
+                self._created_message(created, supporter),
+                reply_to_message_id=reply_to.message_id if reply_to else None,
+                reply_markup=_menu_keyboard(),
+            )
+            return
+
+        if not action.supporter_id:
+            await self.pending_actions.clear(chat_id, user_id)
+            await self.telegram.send_message(chat_id, "❌ Supporter ID is missing.")
+            return
+
+        raw_patch = self._wizard_update_patch(action)
+        if not raw_patch:
+            await self.pending_actions.clear(chat_id, user_id)
+            await self.telegram.send_message(
+                chat_id,
+                "ℹ️ No changes were made.",
+                reply_markup={
+                    "inline_keyboard": [
+                        [
+                            {
+                                "text": "📋 Back to list",
+                                "callback_data": f"sp:list:{action.return_page}",
+                            },
+                            {"text": "🏠 Menu", "callback_data": "sp:menu"},
+                        ]
+                    ]
+                },
+            )
+            return
+
+        try:
+            patch = SupporterUpdate.model_validate(raw_patch)
+            updated = await self.supabase.update_supporter(
+                action.supporter_id,
+                _supporter_row(patch),
+            )
+        except ValidationError as exc:
+            first_error = exc.errors()[0].get("msg", "Invalid supporter update.")
+            await self.telegram.send_message(
+                chat_id,
+                f"❌ {escape(str(first_error).replace('Value error, ', ''))}",
+                reply_markup=self._wizard_keyboard(action),
+            )
+            return
+        except SupabaseError as exc:
+            logger.warning(
+                "Telegram supporter wizard update failed: id=%s status=%s code=%s",
+                action.supporter_id,
+                exc.status_code,
+                exc.code,
+            )
+            await self.telegram.send_message(chat_id, _database_error_message(exc))
+            return
+
+        if updated is None:
+            await self.pending_actions.clear(chat_id, user_id)
+            await self.telegram.send_message(
+                chat_id,
+                "❌ Supporter not found. It may already have been deleted.",
+                reply_markup=_menu_keyboard(),
+            )
+            return
+
+        await self.pending_actions.clear(chat_id, user_id)
+        await self.telegram.send_message(
+            chat_id,
+            "✅ <b>Supporter updated</b>\n"
+            "បានកែប្រែអ្នកគាំទ្ររួចរាល់។\n\n"
+            f"👤 {escape(str(updated.get('name') or 'Unknown'))}",
+            reply_markup={
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": "📋 Back to list",
+                            "callback_data": f"sp:list:{action.return_page}",
+                        },
+                        {"text": "🏠 Menu", "callback_data": "sp:menu"},
+                    ]
+                ]
+            },
+        )
 
     async def _send_supporter_list(self, message: TelegramMessage, page: int) -> None:
         text, keyboard = await self._supporter_list_view(page)
@@ -678,7 +1197,11 @@ class TelegramCommandService:
         )
         return "\n".join(lines), {"inline_keyboard": keyboard_rows}
 
-    async def _handle_callback(self, callback: TelegramCallbackQuery) -> None:
+    async def _handle_callback(
+        self,
+        update_id: int,
+        callback: TelegramCallbackQuery,
+    ) -> None:
         message = callback.message
         data = callback.data or ""
         if message is None:
@@ -714,23 +1237,105 @@ class TelegramCommandService:
             return
 
         if action == "add":
-            await self.pending_actions.set(
-                message.chat.id,
-                callback.from_user.id,
-                PendingAction(kind="add"),
+            pending = PendingAction(
+                kind="add",
+                step="name",
+                data={
+                    "currency": "USD",
+                    "message": None,
+                    "avatar_url": None,
+                    "payment_method": None,
+                    "is_visible": True,
+                },
             )
-            await self.telegram.send_message(
-                message.chat.id,
-                "➕ <b>Add supporter</b>\n"
-                "Reply with:\n"
-                "<code>Name | Amount | Currency | Message | Avatar URL | Payment method</code>\n\n"
-                "Only name and amount are required. Send <code>/cancel</code> to stop.",
-                reply_markup=_force_reply("Name | Amount | USD | Message | Avatar | ABA"),
+            await self.pending_actions.set(message.chat.id, callback.from_user.id, pending)
+            await self._send_wizard_prompt(message.chat.id, pending)
+            await self.telegram.answer_callback_query(callback.id, "Step 1: reply with the name.")
+            return
+
+        if action == "wizard":
+            pending = await self.pending_actions.get(message.chat.id, callback.from_user.id)
+            if pending is None:
+                await self.telegram.answer_callback_query(
+                    callback.id,
+                    "This form expired. Start again.",
+                    show_alert=True,
+                )
+                return
+            operation = parts[2] if len(parts) > 2 else ""
+            if operation == "cancel":
+                await self.pending_actions.clear(message.chat.id, callback.from_user.id)
+                await self.telegram.answer_callback_query(callback.id, "Cancelled.")
+                await self.telegram.send_message(
+                    message.chat.id,
+                    "✅ Current action cancelled.",
+                    reply_markup=_menu_keyboard(),
+                )
+                return
+            if operation == "back":
+                await self.telegram.answer_callback_query(callback.id)
+                await self._wizard_back(message.chat.id, callback.from_user.id, pending)
+                return
+            if operation == "skip":
+                await self.telegram.answer_callback_query(callback.id)
+                await self._wizard_skip(message.chat.id, callback.from_user.id, pending)
+                return
+            if operation == "keep":
+                if pending.kind != "update":
+                    await self.telegram.answer_callback_query(callback.id, "Not available.")
+                    return
+                await self.telegram.answer_callback_query(callback.id)
+                await self._advance_wizard(message.chat.id, callback.from_user.id, pending)
+                return
+            if operation == "clear":
+                if pending.kind != "update" or pending.step not in OPTIONAL_FIELDS:
+                    await self.telegram.answer_callback_query(
+                        callback.id,
+                        "This field cannot be cleared.",
+                    )
+                    return
+                pending.data[pending.step] = None
+                await self.telegram.answer_callback_query(callback.id)
+                await self._advance_wizard(message.chat.id, callback.from_user.id, pending)
+                return
+            if operation == "value" and len(parts) >= 4:
+                raw_value = ":".join(parts[3:])
+                try:
+                    pending.data[pending.step] = self._parse_wizard_field(pending.step, raw_value)
+                except ValueError as exc:
+                    await self.telegram.answer_callback_query(
+                        callback.id,
+                        str(exc)[:180],
+                        show_alert=True,
+                    )
+                    return
+                await self.telegram.answer_callback_query(callback.id)
+                await self._advance_wizard(message.chat.id, callback.from_user.id, pending)
+                return
+            if operation == "save":
+                if pending.step != "confirm":
+                    await self.telegram.answer_callback_query(
+                        callback.id,
+                        "Complete all steps first.",
+                    )
+                    return
+                await self.telegram.answer_callback_query(callback.id, "Saving…")
+                await self._save_wizard(
+                    update_id,
+                    message.chat.id,
+                    callback.from_user.id,
+                    pending,
+                )
+                return
+            await self.telegram.answer_callback_query(
+                callback.id,
+                "Unknown form action.",
+                show_alert=True,
             )
-            await self.telegram.answer_callback_query(callback.id, "Send the supporter details.")
             return
 
         if action == "list":
+            await self.pending_actions.clear(message.chat.id, callback.from_user.id)
             page = self._page_from_parts(parts, 2)
             text, keyboard = await self._supporter_list_view(page)
             await self.telegram.edit_message_text(
@@ -763,24 +1368,35 @@ class TelegramCommandService:
                 )
                 return
 
-            await self.pending_actions.set(
-                message.chat.id,
-                callback.from_user.id,
-                PendingAction(kind="update", supporter_id=supporter_id, return_page=page),
+            try:
+                current = SupporterCreate(
+                    name=supporter.get("name"),
+                    amount=supporter.get("amount"),
+                    currency=supporter.get("currency") or "USD",
+                    message=supporter.get("message"),
+                    avatar_url=supporter.get("avatar_url"),
+                    payment_method=supporter.get("payment_method"),
+                    is_visible=supporter.get("is_visible", True),
+                ).model_dump()
+            except ValidationError:
+                await self.telegram.answer_callback_query(
+                    callback.id,
+                    "Supporter data is invalid.",
+                    show_alert=True,
+                )
+                return
+
+            pending = PendingAction(
+                kind="update",
+                step="name",
+                data=dict(current),
+                original=dict(current),
+                supporter_id=supporter_id,
+                return_page=page,
             )
-            current_name = escape(str(supporter.get("name") or "Unknown"))
-            current_currency = str(supporter.get("currency") or "USD").upper()
-            current_amount = _parse_decimal(supporter.get("amount"))
-            await self.telegram.send_message(
-                message.chat.id,
-                "✏️ <b>Update supporter</b>\n"
-                f"👤 <b>Current:</b> {current_name}\n"
-                f"💵 <b>Amount:</b> "
-                f"{escape(_format_amount(current_amount, current_currency))}\n\n"
-                f"{UPDATE_USAGE}\n\nSend <code>/cancel</code> to stop.",
-                reply_markup=_force_reply("name=... | amount=... | payment=..."),
-            )
-            await self.telegram.answer_callback_query(callback.id, "Send the fields to update.")
+            await self.pending_actions.set(message.chat.id, callback.from_user.id, pending)
+            await self._send_wizard_prompt(message.chat.id, pending)
+            await self.telegram.answer_callback_query(callback.id, "Step 1: reply or keep current.")
             return
 
         if action == "del" and len(parts) >= 3:

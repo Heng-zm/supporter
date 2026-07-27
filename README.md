@@ -2,21 +2,17 @@
 
 FastAPI backend for supporter management, encrypted visit alerts, Supabase storage, and Telegram administration.
 
-## Version 1.4.0 improvements
+## Version 1.5.0 improvements
 
-- Adds a Telegram supporter-management panel with inline buttons.
-- Adds `➕ Add supporter` and `📋 Supporter list` buttons through `/manage`.
-- Adds paginated supporter lists with visible/hidden status.
-- Adds per-supporter `✏️ Update` and `🗑 Delete` buttons.
-- Adds delete confirmation before removing a supporter.
-- Adds guided add and update reply workflows with a 10-minute action timeout.
-- Adds `/list`, `/supporters`, `/manage`, and `/cancel` commands.
-- Supports partial updates such as `name=... | amount=... | payment=...`.
-- Supports clearing optional fields with `message=none`, `avatar=none`, or `payment=none`.
-- Keeps all management actions restricted to the configured chat and administrators.
-- Configures Telegram to deliver both `message` and `callback_query` webhook updates.
-- Keeps the existing secure and idempotent `/add` command.
-- Includes all reliability, security, cache, retry, and Supabase fixes from version 1.3.2.
+- Replaces the normal add form with a one-question-at-a-time Telegram wizard.
+- Replaces the normal update form with the same guided reply workflow.
+- Adds bilingual English/Khmer prompts for the main data-entry questions.
+- Adds one-tap buttons for USD, KHR, ABA, ACLEDA, Cash, visible, and hidden.
+- Adds `Skip`, `Keep current`, `Clear`, `Back`, and `Cancel` controls.
+- Shows a complete confirmation screen before creating or updating a supporter.
+- Revalidates the complete supporter record immediately before saving.
+- Keeps the compact `/add Name | Amount | ...` and `name=value | ...` formats for experienced administrators.
+- Keeps list pagination, update buttons, delete confirmation, authorization, retry handling, and database idempotency from version 1.4.0.
 
 ## Telegram supporter manager
 
@@ -26,14 +22,13 @@ Open the manager with:
 /manage
 ```
 
-The bot displays these buttons:
+The bot displays:
 
-- `➕ Add supporter`: starts a guided reply for supporter details.
+- `➕ Add supporter`: starts the guided add wizard.
 - `📋 Supporter list`: shows supporters five at a time.
-- `✏️ Update`: starts a guided partial-update reply for the selected supporter.
-- `🗑 Delete`: opens a confirmation screen before deletion.
-- `⬅️ Previous` and `Next ➡️`: navigate long supporter lists.
-- `🔄 Refresh`: reloads the current page.
+- `✏️ Update`: starts the guided update wizard for a selected supporter.
+- `🗑 Delete`: asks for confirmation before deletion.
+- `⬅️ Previous`, `Next ➡️`, and `🔄 Refresh`: navigate the list.
 
 You can also open the list directly:
 
@@ -42,30 +37,54 @@ You can also open the list directly:
 /supporters
 ```
 
-To update a supporter after pressing `✏️ Update`, reply with only the fields that
-should change:
+### Guided add workflow
+
+Press `➕ Add supporter` or send `/add`. The bot asks for one value at a time:
+
+1. Name
+2. Amount
+3. Currency
+4. Message
+5. Avatar URL
+6. Payment method
+7. Public visibility
+8. Final confirmation
+
+Reply directly to each question. Buttons are provided for common choices such as
+`USD`, `KHR`, `ABA`, `ACLEDA`, `Cash`, visible, and hidden.
+
+Optional fields can be skipped. Before saving, the bot shows the complete record
+and waits for `✅ Save`.
+
+### Guided update workflow
+
+Open the supporter list and press `✏️ Update`. The bot shows the current value at
+each step. Use:
+
+- `➡️ Keep current` to leave a value unchanged.
+- `🧹 Clear` to remove an optional message, avatar, or payment method.
+- `⬅️ Back` to return to the previous field.
+- `❌ Cancel` to stop without saving.
+
+The bot saves only fields that actually changed.
+
+### Reply commands
+
+These commands work while a guided form is active:
+
+```text
+/back
+/skip
+/cancel
+```
+
+Pending forms expire automatically after 10 minutes.
+
+The older compact update format remains available after pressing `✏️ Update`:
 
 ```text
 name=New Name | amount=20 | currency=USD | payment=ABA
 ```
-
-Available update fields:
-
-```text
-name, amount, currency, message, avatar, payment, visible
-```
-
-Examples:
-
-```text
-message=Thank you for your support
-avatar=https://example.com/avatar.jpg
-payment=none
-visible=false
-```
-
-Use `/cancel` to cancel an active add or update action. Pending actions expire
-automatically after 10 minutes.
 
 After upgrading, redeploy with `TELEGRAM_AUTO_CONFIGURE_WEBHOOK=true`, or run:
 
@@ -73,8 +92,7 @@ After upgrading, redeploy with `TELEGRAM_AUTO_CONFIGURE_WEBHOOK=true`, or run:
 python scripts/configure_telegram.py
 ```
 
-This is required once so Telegram starts sending `callback_query` updates for the
-new buttons. No database migration is required when upgrading from version 1.3.2.
+No database migration is required when upgrading from version 1.3.2 or newer.
 
 ## Telegram `/add` command
 
@@ -111,7 +129,7 @@ For group chats, `TELEGRAM_ADMIN_USER_IDS` is mandatory.
 
 ## Upgrade notes
 
-Upgrading from version 1.3.2 to 1.4.0 does not require a database migration. Redeploy the backend so the webhook is reconfigured to accept button callback updates.
+Upgrading from version 1.3.2 through 1.4.0 to 1.5.0 does not require a database migration. Redeploy the backend so the webhook is reconfigured to accept button callback updates.
 
 For versions older than 1.3.2, run `supabase_migration_v1_3_2.sql` once in the Supabase SQL Editor. It replaces the partial Telegram update index with a normal unique index so PostgREST can use:
 
