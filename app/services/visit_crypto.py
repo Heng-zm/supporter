@@ -17,7 +17,6 @@ from app.models import EncryptedVisitEnvelope, VisitPayload
 
 ENCRYPTION_NAME = "rsa-oaep-aes-gcm-v1"
 AAD = b"ozo-visit-v1"
-
 logger = logging.getLogger("app.visit_crypto")
 
 
@@ -27,14 +26,7 @@ class VisitCryptoService:
         self._private_key: rsa.RSAPrivateKey | None = None
         self.load_error: str | None = None
 
-        # Strip ALL whitespace, not just leading/trailing. Env-var dashboards
-        # (Render, Docker, .env editors) frequently wrap or inject newlines
-        # into long pasted values, which base64.b64decode(..., validate=True)
-        # then rejects as invalid characters even though .strip() alone found
-        # nothing to trim.
-        raw_value = settings.visit_private_key_b64 or ""
-        encoded_key = "".join(raw_value.split())
-
+        encoded_key = "".join((settings.visit_private_key_b64 or "").split())
         if not encoded_key:
             return
 
@@ -46,13 +38,12 @@ class VisitCryptoService:
             if key.key_size < 2048:
                 raise ValueError("Visit RSA private key must be at least 2048 bits.")
         except (ValueError, TypeError, binascii.Error) as exc:
-            # A malformed key must not take down the whole API. Log loudly
-            # and continue with encryption disabled instead of crashing
-            # FastAPI's startup (which previously produced a hard deploy
-            # failure with no clear indication that the key was the cause).
-            self.load_error = str(exc) or "VISIT_PRIVATE_KEY_B64 is not a valid base64 PEM private key."
+            self.load_error = (
+                str(exc)
+                or "VISIT_PRIVATE_KEY_B64 is not a valid base64 PEM private key."
+            )
             logger.error(
-                "Visit encryption key could not be loaded; encryption is DISABLED: %s",
+                "Visit encryption key could not be loaded; encryption is disabled: %s",
                 self.load_error,
             )
             return
@@ -62,6 +53,11 @@ class VisitCryptoService:
     @property
     def enabled(self) -> bool:
         return self._private_key is not None
+
+    def ensure_required_encryption_ready(self) -> None:
+        if self.settings.require_encrypted_visits and not self.enabled:
+            detail = self.load_error or "Visit encryption key is not configured."
+            raise RuntimeError(f"Encrypted visits are required but unavailable: {detail}")
 
     def public_key_b64(self) -> str:
         if self._private_key is None:
@@ -107,7 +103,13 @@ class VisitCryptoService:
                 raise ValueError("Invalid AES key length.")
             plaintext = AESGCM(aes_key).decrypt(iv, ciphertext, AAD)
             decoded = json.loads(plaintext.decode("utf-8"))
-        except (InvalidTag, ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (
+            InvalidTag,
+            ValueError,
+            TypeError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ) as exc:
             raise ValueError("Encrypted visit payload could not be decrypted.") from exc
 
         if not isinstance(decoded, dict):

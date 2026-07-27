@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import ipaddress
 import secrets
+from collections.abc import Iterable
 
 
 def secure_equals(left: str, right: str) -> bool:
@@ -20,14 +21,33 @@ def random_id() -> str:
     return secrets.token_urlsafe(18)
 
 
-def mask_ip(value: str) -> str:
+def parse_ip(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    value = value.strip().strip('"').strip("[]")
+    if not value:
+        return None
     try:
-        address = ipaddress.ip_address(value)
+        return ipaddress.ip_address(value)
     except ValueError:
+        return None
+
+
+def ip_is_trusted(
+    value: str,
+    networks: Iterable[ipaddress.IPv4Network | ipaddress.IPv6Network],
+) -> bool:
+    address = parse_ip(value)
+    if address is None:
+        return False
+    return any(address.version == network.version and address in network for network in networks)
+
+
+def mask_ip(value: str) -> str:
+    address = parse_ip(value)
+    if address is None:
         return "Unknown"
 
     if address.version == 4:
-        parts = value.split(".")
+        parts = address.compressed.split(".")
         return f"{parts[0]}.{parts[1]}.x.x"
 
     network = ipaddress.ip_network(f"{address}/32", strict=False)

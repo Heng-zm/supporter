@@ -17,6 +17,7 @@ from app.models import (
 )
 from app.services.supabase import SupabaseError, SupabaseService
 
+
 router = APIRouter(prefix="/supporters", tags=["supporters"])
 
 
@@ -28,7 +29,7 @@ def _json_row(model: SupporterCreate | SupporterUpdate) -> dict[str, Any]:
     return data
 
 
-def _provider_error(exc: Exception) -> HTTPException:
+def _provider_error() -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_502_BAD_GATEWAY,
         detail="The supporter database is temporarily unavailable.",
@@ -57,21 +58,12 @@ async def list_supporters(
         return SupportersResponse(supporters=[], source=source)
 
     try:
-        resilient_reader = getattr(supabase, "list_supporters_resilient", None)
-        if callable(resilient_reader):
-            rows, source, stale = await resilient_reader(requested_limit)
-        else:
-            rows = await supabase.list_supporters(requested_limit)
-            source, stale = "supabase", False
-
-        _set_public_headers(response, source, stale)
-        return SupportersResponse(
-            supporters=rows,
-            source=source,
-            stale=stale,
-        )
+        rows, source, stale = await supabase.list_supporters_resilient(requested_limit)
     except SupabaseError as exc:
-        raise _provider_error(exc) from exc
+        raise _provider_error() from exc
+
+    _set_public_headers(response, source, stale)
+    return SupportersResponse(supporters=rows, source=source, stale=stale)
 
 
 @router.post("", response_model=SupporterResponse, status_code=status.HTTP_201_CREATED)
@@ -86,7 +78,7 @@ async def create_supporter(
         row = await supabase.create_supporter(_json_row(payload))
         return SupporterResponse(supporter=row)
     except SupabaseError as exc:
-        raise _provider_error(exc) from exc
+        raise _provider_error() from exc
 
 
 @router.patch("/{supporter_id}", response_model=SupporterResponse)
@@ -100,11 +92,11 @@ async def update_supporter(
         raise HTTPException(status_code=503, detail="Supabase is not configured.")
     try:
         row = await supabase.update_supporter(str(supporter_id), _json_row(payload))
-        if row is None:
-            raise HTTPException(status_code=404, detail="Supporter not found.")
-        return SupporterResponse(supporter=row)
     except SupabaseError as exc:
-        raise _provider_error(exc) from exc
+        raise _provider_error() from exc
+    if row is None:
+        raise HTTPException(status_code=404, detail="Supporter not found.")
+    return SupporterResponse(supporter=row)
 
 
 @router.delete("/{supporter_id}", response_model=DeleteResponse)
@@ -116,7 +108,9 @@ async def delete_supporter(
     if not supabase.enabled:
         raise HTTPException(status_code=503, detail="Supabase is not configured.")
     try:
-        await supabase.delete_supporter(str(supporter_id))
-        return DeleteResponse()
+        deleted = await supabase.delete_supporter(str(supporter_id))
     except SupabaseError as exc:
-        raise _provider_error(exc) from exc
+        raise _provider_error() from exc
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Supporter not found.")
+    return DeleteResponse()

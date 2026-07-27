@@ -1,5 +1,16 @@
 __pycache__/
 .pytest_cache/
+.ruff_cache/
 .venv/
-.env
+.env*
 *.pyc
+*.pyo
+*.zip
+.git/
+.github/
+tests/
+scripts/
+README.md
+supabase_schema.sql
+pyproject.toml
+requirements-dev.txt

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from html import escape
 from typing import Any
@@ -9,12 +10,16 @@ import httpx
 from app.config import Settings
 
 
+TRANSIENT_TELEGRAM_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
 @dataclass(slots=True)
 class TelegramResult:
     ok: bool
     skipped: bool = False
     message_id: str | None = None
     error: str | None = None
+    data: dict[str, Any] | None = None
 
 
 class TelegramService:
@@ -27,10 +32,94 @@ class TelegramService:
         text = str(value if value is not None else "").strip() or fallback
         return escape(text[:maximum], quote=True)
 
+    @staticmethod
+    def _retry_delay(response: httpx.Response, attempt: int) -> float:
+        retry_after = response.headers.get("retry-after", "").strip()
+        try:
+            return min(5.0, max(0.0, float(retry_after)))
+        except ValueError:
+            return 0.2 * (2**attempt)
+
+    async def _call(
+        self,
+        method: str,
+        payload: dict[str, Any],
+        *,
+        retry_safe: bool = False,
+    ) -> TelegramResult:
+        if not self.settings.telegram_bot_enabled:
+            return TelegramResult(
+                ok=False,
+                skipped=True,
+                error="Telegram bot is not configured.",
+            )
+
+        url = f"https://api.telegram.org/bot{self.settings.telegram_bot_token}/{method}"
+        attempts = 3 if retry_safe else 1
+
+        for attempt in range(attempts):
+            try:
+                response = await self.client.post(url, json=payload)
+            except httpx.HTTPError as exc:
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(0.2 * (2**attempt))
+                    continue
+                return TelegramResult(ok=False, error=str(exc))
+
+            try:
+                decoded = response.json() if response.content else {}
+            except ValueError:
+                decoded = {}
+            data = decoded if isinstance(decoded, dict) else {}
+
+            error_code = data.get("error_code")
+            transient_code = (
+                error_code if isinstance(error_code, int) else response.status_code
+            )
+            if (
+                retry_safe
+                and transient_code in TRANSIENT_TELEGRAM_STATUS_CODES
+                and attempt + 1 < attempts
+            ):
+                parameters = data.get("parameters")
+                retry_after = (
+                    parameters.get("retry_after")
+                    if isinstance(parameters, dict)
+                    else None
+                )
+                if isinstance(retry_after, (int, float)):
+                    delay = min(5.0, max(0.0, float(retry_after)))
+                else:
+                    delay = self._retry_delay(response, attempt)
+                await asyncio.sleep(delay)
+                continue
+
+            if response.status_code >= 400 or data.get("ok") is False:
+                description = data.get("description") or f"Telegram returned {response.status_code}"
+                return TelegramResult(ok=False, error=str(description), data=data)
+
+            if data.get("ok") is not True:
+                return TelegramResult(
+                    ok=False,
+                    error="Telegram returned an invalid response.",
+                    data=data,
+                )
+
+            result = data.get("result")
+            message_id: str | None = None
+            if isinstance(result, dict) and result.get("message_id") is not None:
+                message_id = str(result["message_id"])
+            return TelegramResult(ok=True, message_id=message_id, data=data)
+
+        return TelegramResult(ok=False, error="Telegram request failed.")
+
     def build_visit_message(self, visit: dict[str, Any]) -> str:
         screen = visit.get("screen") or {}
         connection = visit.get("connection") or {}
-        screen_text = f"{screen.get('width', 0)}x{screen.get('height', 0)} @{screen.get('devicePixelRatio', 1)}x"
+        screen_text = (
+            f"{screen.get('width', 0)}x{screen.get('height', 0)} "
+            f"@{screen.get('devicePixelRatio', 1)}x"
+        )
         lines = [
             "🌐 <b>Website Visit Alert</b>",
             "",
@@ -46,35 +135,65 @@ class TelegramService:
             f"🕒 <b>Timezone:</b> {self._text(visit.get('timezone'))}",
             f"📍 <b>Location:</b> {self._text(visit.get('location'))}",
             f"📶 <b>Network:</b> {self._text(connection.get('effectiveType'))}",
-            f"🔐 <b>Visitor:</b> {self._text(visit.get('visitor_id'))} / {self._text(visit.get('masked_ip'))}",
+            f"🔐 <b>Visitor:</b> {self._text(visit.get('visitor_id'))} / "
+            f"{self._text(visit.get('masked_ip'))}",
             "",
             "👤 A user opened the donation website.",
         ]
         message = "\n".join(lines)
         return message if len(message) <= 3900 else f"{message[:3899]}…"
 
-    async def send_visit(self, visit: dict[str, Any]) -> TelegramResult:
-        if not self.settings.telegram_enabled:
-            return TelegramResult(ok=False, skipped=True, error="Telegram is not configured.")
+    async def send_message(
+        self,
+        chat_id: str | int,
+        text: str,
+        *,
+        reply_to_message_id: int | None = None,
+    ) -> TelegramResult:
+        payload: dict[str, Any] = {
+            "chat_id": str(chat_id),
+            "text": text[:4096],
+            "parse_mode": "HTML",
+            "link_preview_options": {"is_disabled": True},
+        }
+        if reply_to_message_id is not None:
+            payload["reply_parameters"] = {"message_id": reply_to_message_id}
+        # sendMessage is not retried after ambiguous network failures because
+        # Telegram has no client idempotency key and a retry could duplicate it.
+        return await self._call("sendMessage", payload)
 
-        url = f"https://api.telegram.org/bot{self.settings.telegram_bot_token}/sendMessage"
-        try:
-            response = await self.client.post(
-                url,
-                json={
-                    "chat_id": self.settings.telegram_chat_id,
-                    "text": self.build_visit_message(visit),
-                    "parse_mode": "HTML",
-                    "link_preview_options": {"is_disabled": True},
-                },
+    async def send_visit(self, visit: dict[str, Any]) -> TelegramResult:
+        if not self.settings.telegram_visit_alert_enabled:
+            return TelegramResult(
+                ok=False,
+                skipped=True,
+                error="Telegram visit alerts are not configured.",
             )
-            data = response.json() if response.content else {}
-            if response.status_code >= 400 or data.get("ok") is False:
-                return TelegramResult(
-                    ok=False,
-                    error=str(data.get("description") or f"Telegram returned {response.status_code}"),
-                )
-            message_id = data.get("result", {}).get("message_id")
-            return TelegramResult(ok=True, message_id=str(message_id) if message_id is not None else None)
-        except (httpx.HTTPError, ValueError) as exc:
-            return TelegramResult(ok=False, error=str(exc))
+        return await self.send_message(
+            self.settings.telegram_chat_id,
+            self.build_visit_message(visit),
+        )
+
+    async def configure_webhook(self) -> TelegramResult:
+        return await self._call(
+            "setWebhook",
+            {
+                "url": self.settings.telegram_webhook_url,
+                "secret_token": self.settings.telegram_webhook_secret,
+                "allowed_updates": ["message"],
+                "drop_pending_updates": False,
+            },
+            retry_safe=True,
+        )
+
+    async def configure_commands(self) -> TelegramResult:
+        return await self._call(
+            "setMyCommands",
+            {
+                "commands": [
+                    {"command": "add", "description": "Add a new supporter"},
+                    {"command": "help", "description": "Show command help"},
+                ]
+            },
+            retry_safe=True,
+        )

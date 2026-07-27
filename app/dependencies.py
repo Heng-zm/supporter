@@ -5,6 +5,7 @@ from fastapi import Header, HTTPException, Request, status
 from app.config import Settings
 from app.services.supabase import SupabaseService
 from app.services.telegram import TelegramService
+from app.services.telegram_commands import TelegramCommandService
 from app.services.visit_crypto import VisitCryptoService
 from app.services.visits import VisitService
 from app.utils.security import secure_equals
@@ -20,6 +21,10 @@ def get_supabase(request: Request) -> SupabaseService:
 
 def get_telegram(request: Request) -> TelegramService:
     return request.app.state.telegram
+
+
+def get_telegram_commands(request: Request) -> TelegramCommandService:
+    return request.app.state.telegram_commands
 
 
 def get_visit_service(request: Request) -> VisitService:

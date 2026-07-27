@@ -1,0 +1,229 @@
+from __future__ import annotations
+
+import asyncio
+import re
+import time
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from html import escape
+from typing import Any
+
+from pydantic import ValidationError
+
+from app.config import Settings
+from app.models import SupporterCreate, TelegramMessage, TelegramUpdate
+from app.services.supabase import SupabaseError, SupabaseService
+from app.services.telegram import TelegramService
+
+
+ADD_USAGE = (
+    "<b>Add supporter</b>\n"
+    "<code>/add Name | Amount | Currency | Message | Avatar URL | Payment method</code>\n\n"
+    "Only name and amount are required. Currency defaults to USD.\n"
+    "Example: <code>/add John Doe | 25.00 | USD | Thank you!</code>"
+)
+
+
+@dataclass(slots=True)
+class ParsedAddCommand:
+    supporter: SupporterCreate
+
+
+class ProcessedUpdateCache:
+    def __init__(self, ttl_seconds: int = 86400, max_items: int = 10000) -> None:
+        self.ttl_seconds = ttl_seconds
+        self.max_items = max_items
+        self._items: dict[int, float] = {}
+        self._lock = asyncio.Lock()
+
+    async def reserve(self, update_id: int) -> bool:
+        now = time.monotonic()
+        async with self._lock:
+            if len(self._items) >= self.max_items:
+                self._items = {
+                    key: expires_at
+                    for key, expires_at in self._items.items()
+                    if expires_at > now
+                }
+                if len(self._items) >= self.max_items:
+                    oldest = min(self._items, key=self._items.get)
+                    self._items.pop(oldest, None)
+            if self._items.get(update_id, 0) > now:
+                return False
+            self._items[update_id] = now + self.ttl_seconds
+            return True
+
+    async def release(self, update_id: int) -> None:
+        async with self._lock:
+            self._items.pop(update_id, None)
+
+
+def _parse_amount(value: str) -> Decimal:
+    raw = value.strip()
+    if "," in raw:
+        valid = re.fullmatch(r"[+-]?\d{1,3}(?:,\d{3})*(?:\.\d+)?", raw)
+    else:
+        valid = re.fullmatch(r"[+-]?(?:\d+(?:\.\d+)?|\.\d+)", raw)
+    if valid is None:
+        raise ValueError("Amount must be a valid en-US number.")
+
+    try:
+        return Decimal(raw.replace(",", ""))
+    except InvalidOperation as exc:
+        raise ValueError("Amount must be a valid number.") from exc
+
+
+def parse_add_command(text: str) -> ParsedAddCommand:
+    command_parts = text.strip().split(maxsplit=1)
+    command = command_parts[0] if command_parts else ""
+    if command.split("@", 1)[0].lower() != "/add":
+        raise ValueError("Not an /add command.")
+    if len(command_parts) < 2 or not command_parts[1].strip():
+        raise ValueError("Name and amount are required.")
+
+    parts = [part.strip() for part in command_parts[1].split("|", 5)]
+    if len(parts) < 2:
+        raise ValueError("Use | between the supporter name and amount.")
+
+    name = parts[0]
+    amount = _parse_amount(parts[1])
+    currency = parts[2] if len(parts) > 2 and parts[2] else "USD"
+    message = parts[3] if len(parts) > 3 and parts[3] else None
+    avatar_url = parts[4] if len(parts) > 4 and parts[4] else None
+    payment_method = parts[5] if len(parts) > 5 and parts[5] else None
+
+    try:
+        supporter = SupporterCreate(
+            name=name,
+            amount=amount,
+            currency=currency,
+            message=message,
+            avatar_url=avatar_url,
+            payment_method=payment_method,
+        )
+    except ValidationError as exc:
+        first_error = exc.errors()[0].get("msg", "Invalid supporter data.")
+        raise ValueError(str(first_error).replace("Value error, ", "")) from exc
+    return ParsedAddCommand(supporter=supporter)
+
+
+def _supporter_row(payload: SupporterCreate) -> dict[str, Any]:
+    row = payload.model_dump()
+    row["amount"] = float(payload.amount)
+    return row
+
+
+def _format_amount(amount: Decimal, currency: str) -> str:
+    number = f"{amount:,.2f}"
+    return f"${number}" if currency == "USD" else f"{number} {currency}"
+
+
+class TelegramCommandService:
+    def __init__(
+        self,
+        settings: Settings,
+        supabase: SupabaseService,
+        telegram: TelegramService,
+    ) -> None:
+        self.settings = settings
+        self.supabase = supabase
+        self.telegram = telegram
+        self.processed_updates = ProcessedUpdateCache()
+
+    def _authorized(self, message: TelegramMessage) -> bool:
+        sender = message.from_user
+        if sender is None or sender.is_bot:
+            return False
+        if str(message.chat.id) != self.settings.telegram_chat_id.strip():
+            return False
+
+        admins = self.settings.telegram_admin_user_ids
+        if admins:
+            return sender.id in admins
+
+        return message.chat.type == "private" and sender.id == message.chat.id
+
+    async def _reply(self, message: TelegramMessage, text: str) -> None:
+        await self.telegram.send_message(
+            message.chat.id,
+            text,
+            reply_to_message_id=message.message_id,
+        )
+
+    async def handle(self, update: TelegramUpdate) -> None:
+        message = update.message
+        if message is None or not message.text:
+            return
+
+        command = message.text.strip().split(maxsplit=1)[0].split("@", 1)[0].lower()
+        if command not in {"/add", "/help", "/start"}:
+            return
+
+        # Reserve only actionable command updates. If an unexpected exception
+        # escapes, release the reservation so Telegram's webhook retry can run.
+        if not await self.processed_updates.reserve(update.update_id):
+            return
+
+        try:
+            await self._handle_reserved(update, message, command)
+        except Exception:
+            await self.processed_updates.release(update.update_id)
+            raise
+
+    async def _handle_reserved(
+        self,
+        update: TelegramUpdate,
+        message: TelegramMessage,
+        command: str,
+    ) -> None:
+        if str(message.chat.id) != self.settings.telegram_chat_id.strip():
+            # Ignore commands from other chats instead of making the bot reply
+            # outside its configured administration channel.
+            return
+
+        if not self._authorized(message):
+            await self._reply(message, "⛔ You are not authorized to use this command.")
+            return
+
+        if command in {"/help", "/start"}:
+            await self._reply(message, ADD_USAGE)
+            return
+
+        try:
+            parsed = parse_add_command(message.text or "")
+        except ValueError as exc:
+            await self._reply(
+                message,
+                f"❌ {escape(str(exc))}\n\n{ADD_USAGE}",
+            )
+            return
+
+        if not self.supabase.enabled:
+            await self._reply(message, "❌ Supabase is not configured.")
+            return
+
+        try:
+            created = await self.supabase.create_supporter_from_telegram(
+                _supporter_row(parsed.supporter),
+                update.update_id,
+            )
+        except SupabaseError:
+            await self._reply(
+                message,
+                "❌ The supporter database is temporarily unavailable. Please try again.",
+            )
+            return
+
+        created_name = escape(str(created.get("name") or parsed.supporter.name))
+        created_currency = str(created.get("currency") or parsed.supporter.currency).upper()
+        try:
+            created_amount = Decimal(str(created.get("amount", parsed.supporter.amount)))
+        except InvalidOperation:
+            created_amount = parsed.supporter.amount
+
+        await self._reply(
+            message,
+            "✅ <b>Supporter added</b>\n"
+            f"👤 <b>Name:</b> {created_name}\n"
+            f"💵 <b>Amount:</b> {escape(_format_amount(created_amount, created_currency))}",
+        )

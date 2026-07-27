@@ -13,6 +13,7 @@ from app.config import Settings
 PUBLIC_SUPPORTER_COLUMNS = (
     "id,name,amount,currency,message,avatar_url,payment_method,created_at"
 )
+TRANSIENT_STATUS_CODES = {429, 502, 503, 504}
 
 
 class SupabaseError(RuntimeError):
@@ -28,7 +29,9 @@ class SupabaseService:
         self._supporters_cache: list[dict[str, Any]] = []
         self._supporters_cache_at = 0.0
         self._supporters_cache_limit = 0
-        self._supporters_lock = asyncio.Lock()
+        self._supporters_generation = 0
+        self._supporters_cache_lock = asyncio.Lock()
+        self._supporters_fetch_lock = asyncio.Lock()
 
     @property
     def enabled(self) -> bool:
@@ -45,6 +48,14 @@ class SupabaseService:
             headers["Prefer"] = prefer
         return headers
 
+    @staticmethod
+    def _retry_delay(response: httpx.Response, attempt: int) -> float:
+        retry_after = response.headers.get("retry-after", "").strip()
+        try:
+            return min(5.0, max(0.0, float(retry_after)))
+        except ValueError:
+            return 0.15 * (2**attempt)
+
     async def _request(
         self,
         method: str,
@@ -53,32 +64,47 @@ class SupabaseService:
         params: dict[str, Any] | None = None,
         body: dict[str, Any] | list[dict[str, Any]] | None = None,
         prefer: str | None = None,
+        retry_safe: bool = False,
     ) -> Any:
         if not self.enabled:
             raise SupabaseError("Supabase is not configured.")
 
-        try:
-            response = await self.client.request(
-                method,
-                f"{self.base_url}/rest/v1/{table}",
-                params=params,
-                json=body,
-                headers=self._headers(prefer),
-            )
-        except httpx.HTTPError as exc:
-            raise SupabaseError("Unable to reach Supabase.") from exc
+        attempts = 3 if method.upper() == "GET" or retry_safe else 1
+        last_network_error: httpx.HTTPError | None = None
 
-        if response.status_code >= 400:
-            detail = response.text[:1000]
-            raise SupabaseError(
-                f"Supabase returned {response.status_code}: {detail}"
-            )
-        if response.status_code == 204 or not response.content:
-            return None
-        try:
-            return response.json()
-        except ValueError as exc:
-            raise SupabaseError("Supabase returned invalid JSON.") from exc
+        for attempt in range(attempts):
+            try:
+                response = await self.client.request(
+                    method,
+                    f"{self.base_url}/rest/v1/{table}",
+                    params=params,
+                    json=body,
+                    headers=self._headers(prefer),
+                )
+            except httpx.HTTPError as exc:
+                last_network_error = exc
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(0.15 * (2**attempt))
+                    continue
+                raise SupabaseError("Unable to reach Supabase.") from exc
+
+            if response.status_code in TRANSIENT_STATUS_CODES and attempt + 1 < attempts:
+                await asyncio.sleep(self._retry_delay(response, attempt))
+                continue
+
+            if response.status_code >= 400:
+                detail = response.text[:1000]
+                raise SupabaseError(
+                    f"Supabase returned {response.status_code}: {detail}"
+                )
+            if response.status_code == 204 or not response.content:
+                return None
+            try:
+                return response.json()
+            except ValueError as exc:
+                raise SupabaseError("Supabase returned invalid JSON.") from exc
+
+        raise SupabaseError("Unable to reach Supabase.") from last_network_error
 
     def _supporters_cache_age(self) -> float:
         if not self._supporters_cache_at:
@@ -108,7 +134,7 @@ class SupabaseService:
         self._supporters_cache_at = time.monotonic()
         self._supporters_cache_limit = limit
 
-    def invalidate_supporters_cache(self) -> None:
+    def _invalidate_supporters_cache_unlocked(self) -> None:
         self._supporters_cache = []
         self._supporters_cache_at = 0.0
         self._supporters_cache_limit = 0
@@ -126,49 +152,86 @@ class SupabaseService:
         )
         return rows if isinstance(rows, list) else []
 
-    async def list_supporters(self, limit: int) -> list[dict[str, Any]]:
-        """Read current data from Supabase and refresh the in-memory cache."""
-        rows = await self._fetch_supporters(limit)
-        self._write_supporters_cache(rows, limit)
+    async def _cache_snapshot(
+        self,
+        limit: int,
+        *,
+        max_age_seconds: int,
+    ) -> tuple[list[dict[str, Any]] | None, int]:
+        async with self._supporters_cache_lock:
+            return (
+                self._read_supporters_cache(limit, max_age_seconds=max_age_seconds),
+                self._supporters_generation,
+            )
+
+    async def _write_cache_if_current(
+        self,
+        rows: list[dict[str, Any]],
+        limit: int,
+        generation: int,
+    ) -> bool:
+        async with self._supporters_cache_lock:
+            if generation != self._supporters_generation:
+                return False
+            self._write_supporters_cache(rows, limit)
+            return True
+
+    async def _invalidate_supporters_cache(self) -> None:
+        async with self._supporters_cache_lock:
+            self._supporters_generation += 1
+            self._invalidate_supporters_cache_unlocked()
+
+    async def _fetch_supporters_consistent(self, limit: int) -> list[dict[str, Any]]:
+        # A mutation is allowed to run while Supabase is serving a list query.
+        # If it completes during the fetch, retry once rather than caching an
+        # older snapshot after the mutation.
+        rows: list[dict[str, Any]] = []
+        for _ in range(2):
+            async with self._supporters_cache_lock:
+                generation = self._supporters_generation
+            rows = await self._fetch_supporters(limit)
+            if await self._write_cache_if_current(rows, limit, generation):
+                return rows
         return rows
+
+    async def list_supporters(self, limit: int) -> list[dict[str, Any]]:
+        async with self._supporters_fetch_lock:
+            return await self._fetch_supporters_consistent(limit)
 
     async def list_supporters_resilient(
         self,
         limit: int,
     ) -> tuple[list[dict[str, Any]], str, bool]:
-        """Return fresh supporters, using a short cache and stale fallback.
-
-        The browser already has its own local cache. This server cache reduces
-        Supabase requests and keeps the public list available during short
-        provider/network failures without exposing an error panel in the UI.
-        """
-        fresh = self._read_supporters_cache(
+        fresh, _ = await self._cache_snapshot(
             limit,
             max_age_seconds=self.settings.supporters_cache_ttl_seconds,
         )
         if fresh is not None:
             return fresh, "memory-cache", False
 
-        async with self._supporters_lock:
-            fresh = self._read_supporters_cache(
+        async with self._supporters_fetch_lock:
+            fresh, _ = await self._cache_snapshot(
                 limit,
                 max_age_seconds=self.settings.supporters_cache_ttl_seconds,
             )
             if fresh is not None:
                 return fresh, "memory-cache", False
 
+            stale, stale_generation = await self._cache_snapshot(
+                limit,
+                max_age_seconds=self.settings.supporters_stale_cache_seconds,
+            )
             try:
-                rows = await self._fetch_supporters(limit)
+                rows = await self._fetch_supporters_consistent(limit)
             except SupabaseError:
-                stale = self._read_supporters_cache(
-                    limit,
-                    max_age_seconds=self.settings.supporters_stale_cache_seconds,
-                )
-                if stale is not None:
+                async with self._supporters_cache_lock:
+                    generation_unchanged = (
+                        stale_generation == self._supporters_generation
+                    )
+                if stale is not None and generation_unchanged:
                     return stale, "stale-memory-cache", True
                 raise
 
-            self._write_supporters_cache(rows, limit)
             return rows, "supabase", False
 
     async def create_supporter(self, row: dict[str, Any]) -> dict[str, Any]:
@@ -181,7 +244,42 @@ class SupabaseService:
         )
         if not isinstance(rows, list) or not rows:
             raise SupabaseError("Supabase did not return the created supporter.")
-        self.invalidate_supporters_cache()
+        await self._invalidate_supporters_cache()
+        return rows[0]
+
+    async def create_supporter_from_telegram(
+        self,
+        row: dict[str, Any],
+        update_id: int,
+    ) -> dict[str, Any]:
+        telegram_row = dict(row)
+        telegram_row["telegram_update_id"] = update_id
+        rows = await self._request(
+            "POST",
+            "supporters",
+            params={
+                "on_conflict": "telegram_update_id",
+                "select": PUBLIC_SUPPORTER_COLUMNS,
+            },
+            body=telegram_row,
+            prefer="resolution=ignore-duplicates,return=representation",
+            retry_safe=True,
+        )
+        if not isinstance(rows, list) or not rows:
+            rows = await self._request(
+                "GET",
+                "supporters",
+                params={
+                    "select": PUBLIC_SUPPORTER_COLUMNS,
+                    "telegram_update_id": f"eq.{update_id}",
+                    "limit": "1",
+                },
+            )
+        if not isinstance(rows, list) or not rows:
+            raise SupabaseError(
+                "Supabase did not return the Telegram-created supporter."
+            )
+        await self._invalidate_supporters_cache()
         return rows[0]
 
     async def update_supporter(
@@ -192,29 +290,77 @@ class SupabaseService:
         rows = await self._request(
             "PATCH",
             "supporters",
-            params={"id": f"eq.{supporter_id}", "select": PUBLIC_SUPPORTER_COLUMNS},
+            params={
+                "id": f"eq.{quote(supporter_id, safe='')}",
+                "select": PUBLIC_SUPPORTER_COLUMNS,
+            },
             body=patch,
             prefer="return=representation",
         )
-        self.invalidate_supporters_cache()
-        return rows[0] if isinstance(rows, list) and rows else None
+        if isinstance(rows, list) and rows:
+            await self._invalidate_supporters_cache()
+            return rows[0]
+        return None
 
-    async def delete_supporter(self, supporter_id: str) -> None:
-        await self._request(
+    async def delete_supporter(self, supporter_id: str) -> bool:
+        rows = await self._request(
             "DELETE",
             "supporters",
-            params={"id": f"eq.{supporter_id}"},
-            prefer="return=minimal",
+            params={
+                "id": f"eq.{quote(supporter_id, safe='')}",
+                "select": "id",
+            },
+            prefer="return=representation",
         )
-        self.invalidate_supporters_cache()
+        deleted = bool(isinstance(rows, list) and rows)
+        if deleted:
+            await self._invalidate_supporters_cache()
+        return deleted
+
+    async def find_recent_visit(
+        self,
+        *,
+        ip_hash: str,
+        user_agent: str,
+        since_iso: str,
+    ) -> dict[str, Any] | None:
+        rows = await self._request(
+            "GET",
+            "visit_events",
+            params={
+                "select": "id,telegram_sent,telegram_message_id,telegram_error,created_at",
+                "ip_hash": f"eq.{ip_hash}",
+                "user_agent": f"eq.{user_agent}",
+                "created_at": f"gte.{since_iso}",
+                "order": "created_at.desc",
+                "limit": "1",
+            },
+        )
+        return rows[0] if isinstance(rows, list) and rows else None
 
     async def insert_visit_once(self, row: dict[str, Any]) -> dict[str, Any] | None:
         rows = await self._request(
             "POST",
             "visit_events",
-            params={"on_conflict": "dedupe_key", "select": "id"},
+            params={
+                "on_conflict": "dedupe_key",
+                "select": "id,telegram_sent,telegram_message_id,telegram_error,created_at",
+            },
             body=row,
             prefer="resolution=ignore-duplicates,return=representation",
+            retry_safe=True,
+        )
+        return rows[0] if isinstance(rows, list) and rows else None
+
+    async def get_visit_by_dedupe_key(self, dedupe_key: str) -> dict[str, Any] | None:
+        rows = await self._request(
+            "GET",
+            "visit_events",
+            params={
+                "select": "id,telegram_sent,telegram_message_id,telegram_error,created_at",
+                "dedupe_key": f"eq.{dedupe_key}",
+                "limit": "1",
+            },
         )
         return rows[0] if isinstance(rows, list) and rows else None
 
@@ -236,4 +382,5 @@ class SupabaseService:
                 "telegram_error": error[:500] if error else None,
             },
             prefer="return=minimal",
+            retry_safe=True,
         )
