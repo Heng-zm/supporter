@@ -762,3 +762,262 @@ def test_packaged_main_mounts_telegram_webhook() -> None:
     assert "include_audio_telegram_webhook_router(" in source
     assert "await configure_audio_telegram_webhook(" in source
     assert '"audioTelegramWebhookConfigured"' in source
+
+
+def test_private_chat_allows_listed_admin_when_group_is_configured(tmp_path: Path) -> None:
+    async def run() -> None:
+        async with httpx.AsyncClient() as client:
+            cfg = settings(tmp_path)
+            controller = TelegramAudioController(cfg, client, AudioStore(cfg, client))
+
+            admin_private_message = {
+                "chat": {"id": 200, "type": "private"},
+                "from": {"id": 200},
+            }
+            non_admin_private_message = {
+                "chat": {"id": 999, "type": "private"},
+                "from": {"id": 999},
+            }
+
+            assert controller._authorized(admin_private_message) is True
+            assert controller._authorized(non_admin_private_message) is False
+
+    asyncio.run(run())
+
+
+def test_missing_manifest_is_cached(tmp_path: Path) -> None:
+    async def run() -> None:
+        manifest_reads = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal manifest_reads
+            url = str(request.url)
+            if url.endswith("/storage/v1/bucket/website-audio"):
+                return httpx.Response(200, json={"id": "website-audio"})
+            if url.endswith("/storage/v1/object/website-audio/current.json"):
+                manifest_reads += 1
+                return httpx.Response(
+                    400,
+                    json={
+                        "statusCode": "404",
+                        "error": "not_found",
+                        "message": "Object not found",
+                    },
+                )
+            return httpx.Response(404)
+
+        cfg = replace(
+            settings(tmp_path),
+            storage_mode="supabase",
+            supabase_url="https://project.supabase.co",
+            supabase_secret_key="service-key",
+            metadata_cache_seconds=30,
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            store = AudioStore(cfg, client)
+            assert await store.get_metadata() is None
+            assert await store.get_metadata() is None
+            assert manifest_reads == 1
+
+    asyncio.run(run())
+
+
+def test_storage_failure_uses_short_backoff(tmp_path: Path) -> None:
+    async def run() -> None:
+        bucket_checks = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal bucket_checks
+            if str(request.url).endswith("/storage/v1/bucket/website-audio"):
+                bucket_checks += 1
+                return httpx.Response(500, json={"message": "temporary failure"})
+            return httpx.Response(404)
+
+        cfg = replace(
+            settings(tmp_path),
+            storage_mode="supabase",
+            supabase_url="https://project.supabase.co",
+            supabase_secret_key="service-key",
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            store = AudioStore(cfg, client)
+            for _ in range(2):
+                try:
+                    await store.get_metadata()
+                except Exception as exc:
+                    assert getattr(exc, "code", "") == "supabase_storage_request_failed"
+                else:
+                    raise AssertionError("Storage request should have failed.")
+            assert bucket_checks == 1
+
+    asyncio.run(run())
+
+
+def test_concurrent_duplicate_telegram_update_writes_once(tmp_path: Path) -> None:
+    async def run() -> None:
+        async with httpx.AsyncClient() as client:
+            store = AudioStore(settings(tmp_path), client)
+            source = make_wav()
+
+            first, second = await asyncio.gather(
+                store.replace(
+                    file_name="same.wav",
+                    mime_type="audio/wav",
+                    data=source,
+                    uploaded_by=200,
+                    telegram_file_id="same-file",
+                    telegram_update_id=777,
+                ),
+                store.replace(
+                    file_name="same.wav",
+                    mime_type="audio/wav",
+                    data=source,
+                    uploaded_by=200,
+                    telegram_file_id="same-file",
+                    telegram_update_id=777,
+                ),
+            )
+
+            assert first.version == second.version
+            version_files = [
+                path
+                for path in (tmp_path / "versions").rglob("*")
+                if path.is_file()
+            ]
+            assert len(version_files) == 1
+
+    asyncio.run(run())
+
+
+def test_failed_manifest_write_removes_orphaned_version(tmp_path: Path) -> None:
+    from app.audio_extension.store import AudioStoreError
+
+    async def run() -> None:
+        blocker = tmp_path / "blocked"
+        blocker.write_text("not a directory", encoding="utf-8")
+        cfg = replace(
+            settings(tmp_path),
+            storage_manifest_path="blocked/current.json",
+        )
+
+        async with httpx.AsyncClient() as client:
+            store = AudioStore(cfg, client)
+            try:
+                await store.replace(
+                    file_name="orphan.wav",
+                    mime_type="audio/wav",
+                    data=make_wav(),
+                    uploaded_by=200,
+                    telegram_file_id="orphan",
+                    telegram_update_id=None,
+                )
+            except AudioStoreError as exc:
+                assert exc.code == "local_storage_write_failed"
+            else:
+                raise AssertionError("Manifest write should have failed.")
+
+        versions = tmp_path / "versions"
+        assert not versions.exists() or not any(path.is_file() for path in versions.rglob("*"))
+
+    asyncio.run(run())
+
+
+def test_telegram_download_rejects_oversized_stream(tmp_path: Path) -> None:
+    async def run() -> None:
+        payload = b"x" * 101
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/getFile"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "result": {"file_path": "audio/file.bin"},
+                    },
+                )
+            if "/file/bottoken/audio/file.bin" in url:
+                return httpx.Response(200, content=payload)
+            return httpx.Response(404)
+
+        cfg = replace(settings(tmp_path), max_bytes=100)
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            controller = TelegramAudioController(cfg, client, AudioStore(cfg, client))
+            media = controller._extract_media(
+                {
+                    "document": {
+                        "file_id": "file-id",
+                        "file_name": "file.mp3",
+                        "mime_type": "audio/mpeg",
+                    }
+                }
+            )
+            assert media is not None
+            try:
+                await controller._download(media)
+            except ValueError as exc:
+                assert "too large" in str(exc).lower()
+            else:
+                raise AssertionError("Oversized Telegram download should be rejected.")
+
+    asyncio.run(run())
+
+
+def test_metadata_etag_returns_not_modified(tmp_path: Path) -> None:
+    from fastapi import FastAPI
+    from app.audio_extension.router import router
+
+    async def run() -> None:
+        async with httpx.AsyncClient() as storage_client:
+            store = AudioStore(settings(tmp_path), storage_client)
+            metadata = await store.replace(
+                file_name="etag.wav",
+                mime_type="audio/wav",
+                data=make_wav(),
+                uploaded_by=200,
+                telegram_file_id=None,
+                telegram_update_id=None,
+            )
+
+            app = FastAPI()
+            app.state.audio_store = store
+            app.include_router(router, prefix="/api")
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://test",
+            ) as client:
+                response = await client.get(
+                    "/api/audio/metadata",
+                    headers={"If-None-Match": f'"{metadata.version}"'},
+                )
+                assert response.status_code == 304
+                assert response.content == b""
+                assert response.headers["etag"] == f'"{metadata.version}"'
+
+    asyncio.run(run())
+
+
+def test_anon_supabase_key_is_rejected_before_network(monkeypatch) -> None:
+    import base64
+    import json
+
+    from app.audio_extension.config import AudioSettings
+
+    def encode(value: dict[str, object]) -> str:
+        raw = json.dumps(value, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    anon_key = f"{encode({'alg': 'HS256'})}.{encode({'role': 'anon'})}.signature"
+    monkeypatch.setenv("SUPABASE_URL", "https://project.supabase.co")
+    monkeypatch.setenv("SUPABASE_SECRET_KEY", anon_key)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+    monkeypatch.delenv("SUPABASE_KEY", raising=False)
+
+    cfg = AudioSettings.from_env()
+    assert 'role "anon"' in cfg.configuration_error

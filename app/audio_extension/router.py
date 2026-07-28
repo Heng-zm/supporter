@@ -21,6 +21,7 @@ def _store(request: Request) -> AudioStore:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Audio extension is not initialized.",
+            headers={"Retry-After": "5"},
         )
     return store
 
@@ -30,29 +31,72 @@ def _public_headers(response: Response) -> None:
     response.headers["X-Robots-Tag"] = "noindex, nofollow"
 
 
-@router.get("/metadata")
-async def audio_metadata(request: Request, response: Response) -> dict[str, object]:
+def _etag(version: str) -> str:
+    return f'"{version}"'
+
+
+def _etag_matches(raw_header: str, version: str) -> bool:
+    expected = _etag(version)
+    for item in raw_header.split(","):
+        candidate = item.strip()
+        if candidate == "*":
+            return True
+        if candidate.startswith("W/"):
+            candidate = candidate[2:].strip()
+        if candidate == expected:
+            return True
+    return False
+
+
+def _storage_unavailable(exc: AudioStoreError) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail={
+            "message": "The audio storage service is temporarily unavailable.",
+            "code": exc.code,
+        },
+        headers={"Retry-After": "5"},
+    )
+
+
+@router.get("/metadata", response_model=None)
+async def audio_metadata(
+    request: Request,
+    response: Response,
+) -> dict[str, object] | Response:
     _public_headers(response)
-    response.headers["Cache-Control"] = "no-store, max-age=0"
+    response.headers["Cache-Control"] = "public, max-age=0, must-revalidate"
 
     try:
         metadata = await _store(request).get_metadata()
     except AudioNotConfiguredError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except AudioStoreError as exc:
         raise HTTPException(
-            status_code=503,
-            detail={
-                "message": "The audio storage service is temporarily unavailable.",
-                "code": exc.code,
-            },
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+            headers={"Retry-After": "5"},
         ) from exc
+    except AudioStoreError as exc:
+        raise _storage_unavailable(exc) from exc
+
+    version = metadata.version if metadata is not None else "none"
+    etag = _etag(version)
+    common_headers = {
+        "Cache-Control": "public, max-age=0, must-revalidate",
+        "ETag": etag,
+        "X-Content-Type-Options": "nosniff",
+        "X-Robots-Tag": "noindex, nofollow",
+    }
+    if metadata is not None:
+        common_headers["X-Audio-Version"] = metadata.version
+
+    if _etag_matches(request.headers.get("if-none-match", ""), version):
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=common_headers)
+
+    for key, value in common_headers.items():
+        response.headers[key] = value
 
     if metadata is None:
         return {"ok": True, "available": False}
-
-    response.headers["ETag"] = f'"{metadata.version}"'
-    response.headers["X-Audio-Version"] = metadata.version
     return {"ok": True, **metadata.to_public_dict()}
 
 
@@ -66,25 +110,26 @@ async def audio_file(
             requested_version=version
         )
     except ObjectNotFound as exc:
-        raise HTTPException(status_code=404, detail="No active audio is configured.") from exc
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No active audio is configured.",
+        ) from exc
     except AudioVersionChangedError as exc:
         raise HTTPException(
-            status_code=409,
+            status_code=status.HTTP_409_CONFLICT,
             detail={
                 "message": "The active audio changed. Refresh metadata and retry.",
                 "currentVersion": str(exc),
             },
         ) from exc
     except AudioNotConfiguredError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except AudioStoreError as exc:
         raise HTTPException(
-            status_code=503,
-            detail={
-                "message": "The audio storage service is temporarily unavailable.",
-                "code": exc.code,
-            },
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+            headers={"Retry-After": "5"},
         ) from exc
+    except AudioStoreError as exc:
+        raise _storage_unavailable(exc) from exc
 
     ascii_name = metadata.file_name.encode("ascii", "ignore").decode("ascii") or "audio"
     encoded_name = quote(metadata.file_name, safe="")
@@ -93,7 +138,7 @@ async def audio_file(
         "Content-Disposition": (
             f'inline; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded_name}'
         ),
-        "ETag": f'"{metadata.version}"',
+        "ETag": _etag(metadata.version),
         "X-Audio-Version": metadata.version,
         "X-Content-Type-Options": "nosniff",
         "X-Robots-Tag": "noindex, nofollow",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import httpx
 from fastapi import FastAPI
@@ -25,6 +26,15 @@ async def start_audio_extension(
     *,
     http_client: httpx.AsyncClient | None = None,
 ) -> None:
+    existing_store = getattr(app.state, "audio_store", None)
+    existing_controller = getattr(app.state, "audio_telegram", None)
+    if isinstance(existing_store, AudioStore) and isinstance(
+        existing_controller,
+        TelegramAudioController,
+    ):
+        logger.debug("Audio extension startup skipped because it is already initialized.")
+        return
+
     settings = AudioSettings.from_env()
     owns_client = http_client is None
     client = http_client or httpx.AsyncClient(
@@ -80,13 +90,26 @@ async def start_audio_extension(
 async def close_audio_extension(app: FastAPI) -> None:
     if getattr(app.state, "audio_owns_http_client", False):
         client = getattr(app.state, "audio_http_client", None)
-        if isinstance(client, httpx.AsyncClient):
+        if isinstance(client, httpx.AsyncClient) and not client.is_closed:
             await client.aclose()
+
+    # Clearing references makes repeated lifespan runs in tests and development
+    # deterministic and prevents accidentally reusing a closed HTTP client.
+    for name in (
+        "audio_http_client",
+        "audio_store",
+        "audio_telegram",
+        "audio_settings",
+    ):
+        if hasattr(app.state, name):
+            delattr(app.state, name)
+    app.state.audio_owns_http_client = False
+    app.state.audio_storage_ready = False
 
 
 async def handle_audio_telegram_update(
     app: FastAPI,
-    update: dict,
+    update: dict[str, Any],
 ) -> bool:
     controller = getattr(app.state, "audio_telegram", None)
     if not isinstance(controller, TelegramAudioController):

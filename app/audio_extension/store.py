@@ -43,6 +43,9 @@ class _ObjectNotFound(AudioStoreError):
 
 class AudioStore:
     _READY_CACHE_SECONDS = 30.0
+    _READY_ERROR_CACHE_SECONDS = 5.0
+    _MANIFEST_MAX_BYTES = 64 * 1024
+    _READ_CHUNK_BYTES = 64 * 1024
 
     def __init__(
         self,
@@ -52,8 +55,10 @@ class AudioStore:
         self.settings = settings
         self.client = client
         self._lock = asyncio.Lock()
+        self._replace_lock = asyncio.Lock()
         self._ready_lock = asyncio.Lock()
         self._metadata_cache: AudioMetadata | None = None
+        self._metadata_cache_loaded = False
         self._metadata_cache_at = 0.0
         self._audio_cache_version = ""
         self._audio_cache_bytes: bytes | None = None
@@ -105,6 +110,12 @@ class AudioStore:
         self._storage_error_code = exc.code
         self._storage_error_message = str(exc)
 
+    def _cached_storage_error(self) -> AudioStoreError:
+        return AudioStoreError(
+            self._storage_error_message or "Audio storage is temporarily unavailable.",
+            code=self._storage_error_code or "audio_storage_error",
+        )
+
     def _require_configured(self) -> None:
         error = self.settings.configuration_error
         if error:
@@ -135,7 +146,7 @@ class AudioStore:
     def _response_payload(response: httpx.Response) -> dict[str, Any]:
         try:
             payload = response.json()
-        except (ValueError, json.JSONDecodeError):
+        except ValueError:
             return {}
         return payload if isinstance(payload, dict) else {}
 
@@ -215,39 +226,47 @@ class AudioStore:
 
     async def ensure_ready(self, *, force: bool = False) -> None:
         self._require_configured()
-
-        if self.mode == "local":
-            try:
-                await asyncio.to_thread(
-                    self.settings.local_storage_directory.mkdir,
-                    parents=True,
-                    exist_ok=True,
-                )
-            except OSError as exc:
-                error = AudioStoreError(
-                    f"Local audio directory cannot be created: {exc}",
-                    code="local_storage_unavailable",
-                )
-                self._set_storage_error(error)
-                raise error from exc
-            self._set_ready()
-            return
-
         now = time.monotonic()
-        if (
-            not force
-            and self._storage_ready
-            and now - self._storage_checked_at <= self._READY_CACHE_SECONDS
-        ):
-            return
+
+        if not force and self._storage_checked_at:
+            age = now - self._storage_checked_at
+            if self._storage_ready and age <= self._READY_CACHE_SECONDS:
+                return
+            if (
+                not self._storage_ready
+                and self._storage_error_code
+                and age <= self._READY_ERROR_CACHE_SECONDS
+            ):
+                raise self._cached_storage_error()
 
         async with self._ready_lock:
             now = time.monotonic()
-            if (
-                not force
-                and self._storage_ready
-                and now - self._storage_checked_at <= self._READY_CACHE_SECONDS
-            ):
+            if not force and self._storage_checked_at:
+                age = now - self._storage_checked_at
+                if self._storage_ready and age <= self._READY_CACHE_SECONDS:
+                    return
+                if (
+                    not self._storage_ready
+                    and self._storage_error_code
+                    and age <= self._READY_ERROR_CACHE_SECONDS
+                ):
+                    raise self._cached_storage_error()
+
+            if self.mode == "local":
+                try:
+                    await asyncio.to_thread(
+                        self.settings.local_storage_directory.mkdir,
+                        parents=True,
+                        exist_ok=True,
+                    )
+                except OSError as exc:
+                    error = AudioStoreError(
+                        f"Local audio directory cannot be created: {exc}",
+                        code="local_storage_unavailable",
+                    )
+                    self._set_storage_error(error)
+                    raise error from exc
+                self._set_ready()
                 return
 
             try:
@@ -320,38 +339,107 @@ class AudioStore:
             raise error
 
     def _local_path(self, object_path: str) -> Path:
-        clean_parts = [part for part in object_path.split("/") if part]
+        clean_parts = [part for part in object_path.replace("\\", "/").split("/") if part]
         if not clean_parts or any(part in {".", ".."} for part in clean_parts):
             raise AudioStoreError(
                 "Invalid local audio object path.",
                 code="invalid_local_object_path",
             )
-        return self.settings.local_storage_directory.joinpath(*clean_parts)
 
-    async def _read_object(self, object_path: str) -> bytes:
+        root = self.settings.local_storage_directory.resolve()
+        candidate = root.joinpath(*clean_parts).resolve()
+        if candidate != root and root not in candidate.parents:
+            raise AudioStoreError(
+                "Invalid local audio object path.",
+                code="invalid_local_object_path",
+            )
+        return candidate
+
+    @staticmethod
+    def _declared_content_length(response: httpx.Response) -> int | None:
+        raw = response.headers.get("content-length", "").strip()
+        if not raw:
+            return None
+        try:
+            value = int(raw)
+        except ValueError:
+            return None
+        return value if value >= 0 else None
+
+    async def _read_object(
+        self,
+        object_path: str,
+        *,
+        max_bytes: int,
+        too_large_code: str,
+    ) -> bytes:
         if self.mode == "supabase":
             try:
-                response = await self.client.get(
+                async with self.client.stream(
+                    "GET",
                     self._supabase_object_url(object_path),
                     headers=self._supabase_headers(),
-                )
+                ) as response:
+                    if response.status_code >= 400:
+                        await response.aread()
+                        if self._is_object_not_found(response):
+                            raise _ObjectNotFound(object_path)
+                        raise self._supabase_error(response, operation="read")
+
+                    declared_length = self._declared_content_length(response)
+                    if declared_length is not None and declared_length > max_bytes:
+                        raise AudioStoreError(
+                            "Stored audio object exceeds the allowed size.",
+                            code=too_large_code,
+                        )
+
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in response.aiter_bytes(self._READ_CHUNK_BYTES):
+                        total += len(chunk)
+                        if total > max_bytes:
+                            raise AudioStoreError(
+                                "Stored audio object exceeds the allowed size.",
+                                code=too_large_code,
+                            )
+                        chunks.append(chunk)
+                    return b"".join(chunks)
+            except _ObjectNotFound:
+                raise
+            except AudioStoreError:
+                raise
             except httpx.RequestError as exc:
                 raise AudioStoreError(
                     "Could not connect to Supabase Storage.",
                     code="supabase_network_error",
                 ) from exc
 
-            if self._is_object_not_found(response):
-                raise _ObjectNotFound(object_path)
-            if response.status_code >= 400:
-                raise self._supabase_error(response, operation="read")
-            return bytes(response.content)
-
         path = self._local_path(object_path)
+
+        def bounded_read() -> bytes:
+            try:
+                file_size = path.stat().st_size
+            except FileNotFoundError:
+                raise
+            if file_size > max_bytes:
+                raise AudioStoreError(
+                    "Stored audio object exceeds the allowed size.",
+                    code=too_large_code,
+                )
+            data = path.read_bytes()
+            if len(data) > max_bytes:
+                raise AudioStoreError(
+                    "Stored audio object exceeds the allowed size.",
+                    code=too_large_code,
+                )
+            return data
+
         try:
-            return await asyncio.to_thread(path.read_bytes)
+            return await asyncio.to_thread(bounded_read)
         except FileNotFoundError as exc:
             raise _ObjectNotFound(object_path) from exc
+        except AudioStoreError:
+            raise
         except OSError as exc:
             raise AudioStoreError(
                 f"Local audio read failed: {exc}",
@@ -363,10 +451,13 @@ class AudioStore:
         object_path: str,
         data: bytes,
         content_type: str,
+        *,
+        upsert: bool,
     ) -> None:
         if self.mode == "supabase":
             headers = self._supabase_headers(content_type=content_type)
-            headers["x-upsert"] = "true"
+            if upsert:
+                headers["x-upsert"] = "true"
             headers["cache-control"] = "0"
             try:
                 response = await self.client.post(
@@ -402,32 +493,71 @@ class AudioStore:
                 code="local_storage_write_failed",
             ) from exc
 
+    async def _delete_object(self, object_path: str) -> None:
+        if self.mode == "supabase":
+            try:
+                response = await self.client.delete(
+                    self._supabase_object_url(object_path),
+                    headers=self._supabase_headers(),
+                )
+            except httpx.RequestError as exc:
+                raise AudioStoreError(
+                    "Could not connect to Supabase Storage.",
+                    code="supabase_network_error",
+                ) from exc
+            if response.status_code >= 400 and not self._is_object_not_found(response):
+                raise self._supabase_error(response, operation="delete")
+            return
+
+        path = self._local_path(object_path)
+        try:
+            await asyncio.to_thread(path.unlink, missing_ok=True)
+        except OSError as exc:
+            raise AudioStoreError(
+                f"Local audio delete failed: {exc}",
+                code="local_storage_delete_failed",
+            ) from exc
+
+    async def _cleanup_orphan(self, object_path: str) -> None:
+        try:
+            await self._delete_object(object_path)
+        except AudioStoreError as exc:
+            logger.warning(
+                "Failed to clean up orphaned audio object path=%s code=%s",
+                object_path,
+                exc.code,
+            )
+
+    def _metadata_cache_fresh(self, now: float) -> bool:
+        return (
+            self._metadata_cache_loaded
+            and now - self._metadata_cache_at <= self.settings.metadata_cache_seconds
+        )
+
     async def get_metadata(self, *, force: bool = False) -> AudioMetadata | None:
         await self.ensure_ready()
         now = time.monotonic()
-        cache_ttl = self.settings.metadata_cache_seconds
 
-        if (
-            not force
-            and self._metadata_cache is not None
-            and now - self._metadata_cache_at <= cache_ttl
-        ):
+        if not force and self._metadata_cache_fresh(now):
             return self._metadata_cache
 
         async with self._lock:
             now = time.monotonic()
-            if (
-                not force
-                and self._metadata_cache is not None
-                and now - self._metadata_cache_at <= cache_ttl
-            ):
+            if not force and self._metadata_cache_fresh(now):
                 return self._metadata_cache
 
             try:
-                raw = await self._read_object(self.settings.storage_manifest_path)
+                raw = await self._read_object(
+                    self.settings.storage_manifest_path,
+                    max_bytes=self._MANIFEST_MAX_BYTES,
+                    too_large_code="audio_manifest_too_large",
+                )
             except _ObjectNotFound:
                 self._metadata_cache = None
+                self._metadata_cache_loaded = True
                 self._metadata_cache_at = now
+                self._audio_cache_version = ""
+                self._audio_cache_bytes = None
                 return None
 
             try:
@@ -435,7 +565,7 @@ class AudioStore:
                 if not isinstance(value, dict):
                     raise ValueError("Manifest must be a JSON object.")
                 metadata = AudioMetadata.from_manifest(value)
-            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            except (UnicodeDecodeError, ValueError) as exc:
                 raise AudioStoreError(
                     f"Invalid audio manifest: {exc}",
                     code="audio_manifest_invalid",
@@ -448,6 +578,7 @@ class AudioStore:
                 )
 
             self._metadata_cache = metadata
+            self._metadata_cache_loaded = True
             self._metadata_cache_at = now
             return metadata
 
@@ -476,7 +607,11 @@ class AudioStore:
             ):
                 return metadata, self._audio_cache_bytes
 
-            data = await self._read_object(metadata.object_path)
+            data = await self._read_object(
+                metadata.object_path,
+                max_bytes=self.settings.max_bytes,
+                too_large_code="stored_audio_too_large",
+            )
             if len(data) != metadata.byte_length:
                 raise AudioStoreError(
                     "Stored audio byte length does not match its manifest.",
@@ -511,58 +646,74 @@ class AudioStore:
                 f"Audio exceeds the configured limit of {self.settings.max_bytes} bytes."
             )
 
-        if telegram_update_id is not None:
-            current = await self.get_metadata(force=True)
-            if current is not None and current.telegram_update_id == telegram_update_id:
-                return current
-
         detected_mime, safe_name = validate_audio_bytes(data, mime_type, file_name)
         sha256 = hashlib.sha256(data).hexdigest()
-        now = datetime.now(timezone.utc)
-        version = f"{now.strftime('%Y%m%dT%H%M%SZ')}-{secrets.token_hex(6)}"
-        object_path = f"versions/{version}/{safe_name}"
 
-        metadata = AudioMetadata(
-            version=version,
-            file_name=safe_name,
-            mime_type=detected_mime,
-            byte_length=len(data),
-            sha256=sha256,
-            updated_at=now.isoformat(),
-            object_path=object_path,
-            uploaded_by=uploaded_by,
-            telegram_file_id=telegram_file_id,
-            telegram_update_id=telegram_update_id,
-        )
-        manifest_bytes = json.dumps(
-            metadata.to_manifest(),
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
+        async with self._replace_lock:
+            if telegram_update_id is not None:
+                current = await self.get_metadata(force=True)
+                if (
+                    current is not None
+                    and current.telegram_update_id == telegram_update_id
+                ):
+                    return current
 
-        async with self._lock:
-            # Upload the immutable version first. The manifest is written last,
-            # so readers never observe a version that has no binary object.
-            await self._write_object(object_path, data, detected_mime)
-            await self._write_object(
-                self.settings.storage_manifest_path,
-                manifest_bytes,
-                "application/json",
+            now = datetime.now(timezone.utc)
+            version = f"{now.strftime('%Y%m%dT%H%M%SZ')}-{secrets.token_hex(6)}"
+            object_path = f"versions/{version}/{safe_name}"
+
+            metadata = AudioMetadata(
+                version=version,
+                file_name=safe_name,
+                mime_type=detected_mime,
+                byte_length=len(data),
+                sha256=sha256,
+                updated_at=now.isoformat(),
+                object_path=object_path,
+                uploaded_by=uploaded_by,
+                telegram_file_id=telegram_file_id,
+                telegram_update_id=telegram_update_id,
             )
+            manifest_bytes = json.dumps(
+                metadata.to_manifest(),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
 
-            self._metadata_cache = metadata
-            self._metadata_cache_at = time.monotonic()
-            self._audio_cache_version = metadata.version
-            self._audio_cache_bytes = data
+            async with self._lock:
+                # Upload the immutable version first. The manifest is written last,
+                # so readers never observe a version that has no binary object.
+                await self._write_object(
+                    object_path,
+                    data,
+                    detected_mime,
+                    upsert=False,
+                )
+                try:
+                    await self._write_object(
+                        self.settings.storage_manifest_path,
+                        manifest_bytes,
+                        "application/json",
+                        upsert=True,
+                    )
+                except Exception:
+                    await self._cleanup_orphan(object_path)
+                    raise
 
-        logger.info(
-            "Website audio replaced version=%s bytes=%s uploaded_by=%s mode=%s",
-            metadata.version,
-            metadata.byte_length,
-            uploaded_by,
-            self.mode,
-        )
-        return metadata
+                self._metadata_cache = metadata
+                self._metadata_cache_loaded = True
+                self._metadata_cache_at = time.monotonic()
+                self._audio_cache_version = metadata.version
+                self._audio_cache_bytes = data
+
+            logger.info(
+                "Website audio replaced version=%s bytes=%s uploaded_by=%s mode=%s",
+                metadata.version,
+                metadata.byte_length,
+                uploaded_by,
+                self.mode,
+            )
+            return metadata
 
 
 ObjectNotFound = _ObjectNotFound

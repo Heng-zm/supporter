@@ -1,7 +1,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+import re
 from typing import Any
+
+_VERSION_RE = re.compile(r"^[A-Za-z0-9._-]{1,160}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_ALLOWED_MIME_TYPES = {
+    "audio/mpeg",
+    "audio/wav",
+    "audio/ogg",
+    "audio/mp4",
+    "audio/aac",
+    "audio/webm",
+    "audio/flac",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,19 +70,30 @@ class AudioMetadata:
         except (TypeError, ValueError) as exc:
             raise ValueError("Audio manifest byteLength is invalid.") from exc
 
-        if not version or len(version) > 160:
+        if not _VERSION_RE.fullmatch(version):
             raise ValueError("Audio manifest version is invalid.")
-        if not file_name or len(file_name) > 255:
+        if not file_name or len(file_name) > 255 or any(ch in file_name for ch in "\r\n"):
             raise ValueError("Audio manifest fileName is invalid.")
-        if not mime_type or len(mime_type) > 100:
+        if mime_type not in _ALLOWED_MIME_TYPES:
             raise ValueError("Audio manifest mimeType is invalid.")
         if byte_length <= 0:
             raise ValueError("Audio manifest byteLength is invalid.")
-        if len(sha256) != 64 or any(ch not in "0123456789abcdef" for ch in sha256):
+        if not _SHA256_RE.fullmatch(sha256):
             raise ValueError("Audio manifest sha256 is invalid.")
-        if not updated_at or len(updated_at) > 100:
-            raise ValueError("Audio manifest updatedAt is invalid.")
-        if not object_path or ".." in object_path.split("/"):
+        try:
+            parsed_updated_at = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("Audio manifest updatedAt is invalid.") from exc
+        if parsed_updated_at.tzinfo is None:
+            raise ValueError("Audio manifest updatedAt must include a timezone.")
+
+        parts = object_path.split("/")
+        if (
+            not object_path
+            or len(object_path) > 1024
+            or any(part in {"", ".", ".."} for part in parts)
+            or not object_path.startswith("versions/")
+        ):
             raise ValueError("Audio manifest objectPath is invalid.")
 
         uploaded_by_raw = value.get("uploadedBy")
@@ -78,6 +103,8 @@ class AudioMetadata:
                 uploaded_by = int(uploaded_by_raw)
             except (TypeError, ValueError) as exc:
                 raise ValueError("Audio manifest uploadedBy is invalid.") from exc
+            if uploaded_by <= 0:
+                raise ValueError("Audio manifest uploadedBy is invalid.")
 
         telegram_update_id_raw = value.get("telegramUpdateId")
         telegram_update_id = None
@@ -86,11 +113,15 @@ class AudioMetadata:
                 telegram_update_id = int(telegram_update_id_raw)
             except (TypeError, ValueError) as exc:
                 raise ValueError("Audio manifest telegramUpdateId is invalid.") from exc
+            if telegram_update_id < 0:
+                raise ValueError("Audio manifest telegramUpdateId is invalid.")
 
         telegram_file_id_raw = value.get("telegramFileId")
         telegram_file_id = (
             str(telegram_file_id_raw).strip() if telegram_file_id_raw else None
         )
+        if telegram_file_id is not None and len(telegram_file_id) > 512:
+            raise ValueError("Audio manifest telegramFileId is invalid.")
 
         return cls(
             version=version,

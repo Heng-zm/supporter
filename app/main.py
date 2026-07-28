@@ -25,7 +25,7 @@ from app.services.visit_crypto import VisitCryptoService
 from app.services.visits import VisitService
 
 
-APP_VERSION = "1.1.4-audio"
+APP_VERSION = "2.2.0-audio"
 
 
 def _unique_origins(*origin_groups: list[str] | tuple[str, ...]) -> list[str]:
@@ -97,6 +97,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "Content-Type",
             "X-Admin-Key",
             "X-Telegram-Bot-Api-Secret-Token",
+            "If-None-Match",
         ],
         expose_headers=[
             "X-Supporters-Source",
@@ -120,6 +121,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         audio_store = getattr(app.state, "audio_store", None)
         audio_settings = getattr(app.state, "audio_settings", None)
 
+        audio_storage_error_code = getattr(
+            audio_store,
+            "storage_error_code",
+            getattr(app.state, "audio_storage_error_code", ""),
+        ) or None
+        audio_webhook_error = getattr(
+            app.state,
+            "audio_telegram_webhook_error",
+            "",
+        ) or None
+
         payload: dict[str, object] = {
             "ok": True,
             "service": runtime_settings.app_name,
@@ -135,35 +147,44 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "audioTelegramWebhookConfigured": bool(
                 getattr(app.state, "audio_telegram_webhook_configured", False)
             ),
-            "audioTelegramWebhookURL": getattr(
-                app.state, "audio_telegram_webhook_url", None
-            ),
-            "audioTelegramWebhookError": getattr(
-                app.state, "audio_telegram_webhook_error", ""
-            ) or None,
             "audioExtensionInitialized": audio_store is not None,
             "audioStorageMode": getattr(audio_store, "mode", None),
             "audioStorageReady": getattr(audio_store, "storage_ready", False),
-            "audioStorageErrorCode": getattr(
-                audio_store,
-                "storage_error_code",
-                getattr(app.state, "audio_storage_error_code", ""),
-            ) or None,
-            "audioStorageError": getattr(
-                audio_store,
-                "storage_error_message",
-                getattr(app.state, "audio_storage_error", ""),
-            ) or None,
-            "audioConfigurationError": getattr(
-                audio_settings,
-                "configuration_error",
-                "Audio extension has not started.",
+            "audioStorageErrorCode": audio_storage_error_code,
+            "audioConfigurationValid": not bool(
+                getattr(
+                    audio_settings,
+                    "configuration_error",
+                    "Audio extension has not started.",
+                )
+            ),
+            "audioTelegramWebhookErrorCode": (
+                "telegram_webhook_configuration_failed"
+                if audio_webhook_error
+                else None
             ),
         }
 
-        # Never leak visit-encryption loading details in production.
-        if not runtime_settings.is_production and app.state.visit_crypto.load_error:
-            payload["visitEncryptionError"] = app.state.visit_crypto.load_error
+        # Detailed infrastructure errors can reveal deployment structure. Keep
+        # production health output safe while preserving full diagnostics in
+        # development and test environments.
+        if not runtime_settings.is_production:
+            payload["audioTelegramWebhookURL"] = getattr(
+                app.state, "audio_telegram_webhook_url", None
+            )
+            payload["audioTelegramWebhookError"] = audio_webhook_error
+            payload["audioStorageError"] = getattr(
+                audio_store,
+                "storage_error_message",
+                getattr(app.state, "audio_storage_error", ""),
+            ) or None
+            payload["audioConfigurationError"] = getattr(
+                audio_settings,
+                "configuration_error",
+                "Audio extension has not started.",
+            ) or None
+            if app.state.visit_crypto.load_error:
+                payload["visitEncryptionError"] = app.state.visit_crypto.load_error
 
         return payload
 

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
+import json
 import os
 from pathlib import Path
+from typing import Any
 
 from .source_settings import (
     AUDIO_AUTO_CREATE_BUCKET,
@@ -34,6 +37,47 @@ def _parse_admin_ids(raw: str) -> frozenset[int]:
             raise ValueError("TELEGRAM_ADMIN_USER_IDS values must be positive.")
         values.add(value)
     return frozenset(values)
+
+
+def _decode_jwt_payload(token: str) -> dict[str, Any] | None:
+    """Decode a JWT payload only for safe key classification.
+
+    This does not authenticate or trust the token. Supabase still validates the
+    credential server-side. The decoded role is used only to reject known client
+    keys before making storage requests.
+    """
+
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    payload_segment = parts[1]
+    padding = "=" * (-len(payload_segment) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(payload_segment + padding)
+        value = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _supabase_key_error(key: str) -> str:
+    value = key.strip()
+    if not value:
+        return ""
+    if value.startswith("sb_publishable_"):
+        return (
+            "SUPABASE publishable keys cannot manage private audio storage. "
+            "Use a Supabase secret key or service-role key on the backend."
+        )
+
+    payload = _decode_jwt_payload(value)
+    role = str(payload.get("role") or "").strip().lower() if payload else ""
+    if role in {"anon", "authenticated"}:
+        return (
+            f'Supabase JWT role "{role}" cannot manage private audio storage. '
+            "Use a Supabase secret key or service-role key on the backend."
+        )
+    return ""
 
 
 def _validate_source_settings() -> None:
@@ -88,7 +132,7 @@ class AudioSettings:
 
     @classmethod
     def from_env(cls) -> "AudioSettings":
-        """Load secrets from the environment and non-secret audio settings from source."""
+        """Load secrets from the environment and non-secret settings from source."""
         _validate_source_settings()
 
         environment = os.getenv("APP_ENVIRONMENT", "development").strip().lower()
@@ -146,6 +190,10 @@ class AudioSettings:
             return "AUDIO_STORAGE_MANIFEST_PATH is empty."
         if self.resolved_storage_mode == "supabase" and not self.supabase_configured:
             return "Supabase audio storage is selected but Supabase is not configured."
+        if self.resolved_storage_mode == "supabase":
+            key_error = _supabase_key_error(self.supabase_secret_key)
+            if key_error:
+                return key_error
         if self.require_persistent_storage and self.resolved_storage_mode != "supabase":
             return (
                 "Persistent audio storage is required, but Supabase Storage is not configured."

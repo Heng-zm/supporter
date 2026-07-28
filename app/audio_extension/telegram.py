@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import logging
 from pathlib import PurePath
 import time
-import logging
 from typing import Any
 
 import httpx
@@ -25,6 +25,8 @@ class TelegramMedia:
 
 
 class TelegramAudioController:
+    _DOWNLOAD_CHUNK_BYTES = 64 * 1024
+
     def __init__(
         self,
         settings: AudioSettings,
@@ -54,7 +56,9 @@ class TelegramAudioController:
     @staticmethod
     def _chat_id(message: dict[str, Any]) -> str:
         chat = message.get("chat")
-        return str(chat.get("id")) if isinstance(chat, dict) and chat.get("id") is not None else ""
+        if not isinstance(chat, dict) or chat.get("id") is None:
+            return ""
+        return str(chat.get("id"))
 
     @staticmethod
     def _user_id(message: dict[str, Any]) -> int:
@@ -69,17 +73,31 @@ class TelegramAudioController:
     def _authorized(self, message: dict[str, Any]) -> bool:
         chat_id = self._chat_id(message)
         user_id = self._user_id(message)
-        if not chat_id or not user_id or chat_id != self.settings.telegram_chat_id:
+        if not chat_id or user_id <= 0:
             return False
-        if user_id in self.settings.telegram_admin_user_ids:
-            return True
 
         chat = message.get("chat")
         chat_type = str(chat.get("type") or "") if isinstance(chat, dict) else ""
+        is_private_self_chat = chat_type == "private" and chat_id == str(user_id)
+        is_admin = user_id in self.settings.telegram_admin_user_ids
+
+        # The configured group/channel remains the primary command location.
+        if chat_id == self.settings.telegram_chat_id:
+            if is_admin:
+                return True
+            # Preserve owner-only private-chat setups where TELEGRAM_CHAT_ID is
+            # the owner's user ID and no separate admin list is configured.
+            return bool(
+                self.settings.telegram_allow_owner_private_chat
+                and is_private_self_chat
+            )
+
+        # When the configured chat is a group, listed administrators can still
+        # manage audio by messaging the bot privately when explicitly enabled.
         return bool(
             self.settings.telegram_allow_owner_private_chat
-            and chat_type == "private"
-            and chat_id == str(user_id)
+            and is_private_self_chat
+            and is_admin
         )
 
     @staticmethod
@@ -111,9 +129,10 @@ class TelegramAudioController:
             file_size = None
             if value.get("file_size") is not None:
                 try:
-                    file_size = int(value["file_size"])
+                    parsed_size = int(value["file_size"])
                 except (TypeError, ValueError):
-                    file_size = None
+                    parsed_size = 0
+                file_size = parsed_size if parsed_size >= 0 else None
 
             return TelegramMedia(
                 file_id=file_id,
@@ -134,32 +153,53 @@ class TelegramAudioController:
         reply = message.get("reply_to_message")
         return cls._extract_media(reply) if isinstance(reply, dict) else None
 
+    async def _telegram_json(
+        self,
+        method: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        token = self.settings.telegram_bot_token
+        try:
+            response = await self.client.post(
+                f"https://api.telegram.org/bot{token}/{method}",
+                json=payload,
+            )
+        except httpx.RequestError as exc:
+            raise RuntimeError("Could not connect to the Telegram Bot API.") from exc
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise RuntimeError(f"Telegram {method} returned invalid JSON.") from exc
+
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Telegram {method} returned an invalid response.")
+        if response.status_code >= 400 or data.get("ok") is not True:
+            description = str(data.get("description") or "").strip()
+            raise RuntimeError(description or f"Telegram {method} failed.")
+        return data
+
     async def _send_message(self, chat_id: str, text: str) -> None:
         if not self.settings.telegram_bot_token or not chat_id:
             return
-        url = (
-            f"https://api.telegram.org/bot{self.settings.telegram_bot_token}"
-            "/sendMessage"
-        )
-        response = await self.client.post(
-            url,
-            json={
+        await self._telegram_json(
+            "sendMessage",
+            {
                 "chat_id": chat_id,
                 "text": text[:4000],
                 "disable_web_page_preview": True,
             },
         )
-        if response.status_code >= 400:
-            raise RuntimeError(
-                f"Telegram sendMessage failed with HTTP {response.status_code}."
-            )
 
     async def _safe_send_message(self, chat_id: str, text: str) -> bool:
         try:
             await self._send_message(chat_id, text)
             return True
-        except Exception as exc:
-            logger.warning("Telegram audio status message failed: %s", exc)
+        except Exception as exc:  # Status messages must not undo a completed upload.
+            logger.warning(
+                "Telegram audio status message failed error_type=%s",
+                type(exc).__name__,
+            )
             return False
 
     async def _set_pending(self, key: tuple[str, int]) -> None:
@@ -194,27 +234,24 @@ class TelegramAudioController:
         async with self._pending_lock:
             return self._pending.pop(key, None) is not None
 
+    @staticmethod
+    def _content_length(response: httpx.Response) -> int | None:
+        raw = response.headers.get("content-length", "").strip()
+        if not raw:
+            return None
+        try:
+            value = int(raw)
+        except ValueError:
+            return None
+        return value if value >= 0 else None
+
     async def _download(self, media: TelegramMedia) -> bytes:
         if media.file_size is not None and media.file_size > self.settings.max_bytes:
             raise ValueError(
                 f"Telegram file is too large. Maximum: {self.settings.max_bytes} bytes."
             )
 
-        token = self.settings.telegram_bot_token
-        response = await self.client.post(
-            f"https://api.telegram.org/bot{token}/getFile",
-            json={"file_id": media.file_id},
-        )
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise RuntimeError("Telegram getFile returned invalid JSON.") from exc
-
-        if response.status_code >= 400 or payload.get("ok") is not True:
-            raise RuntimeError(
-                str(payload.get("description") or "Telegram getFile failed.")
-            )
-
+        payload = await self._telegram_json("getFile", {"file_id": media.file_id})
         result = payload.get("result")
         if not isinstance(result, dict):
             raise RuntimeError("Telegram getFile returned no file result.")
@@ -232,19 +269,46 @@ class TelegramAudioController:
         if not file_path or ".." in PurePath(file_path).parts:
             raise RuntimeError("Telegram returned an invalid file path.")
 
-        file_response = await self.client.get(
-            f"https://api.telegram.org/file/bot{token}/{file_path}"
-        )
-        if file_response.status_code >= 400:
-            raise RuntimeError(
-                f"Telegram file download failed with HTTP {file_response.status_code}."
-            )
+        token = self.settings.telegram_bot_token
+        try:
+            async with self.client.stream(
+                "GET",
+                f"https://api.telegram.org/file/bot{token}/{file_path}",
+            ) as response:
+                if response.status_code >= 400:
+                    await response.aread()
+                    raise RuntimeError(
+                        f"Telegram file download failed with HTTP {response.status_code}."
+                    )
 
-        data = bytes(file_response.content)
-        if len(data) > self.settings.max_bytes:
-            raise ValueError(
-                f"Downloaded audio is too large. Maximum: {self.settings.max_bytes} bytes."
-            )
+                declared_length = self._content_length(response)
+                if (
+                    declared_length is not None
+                    and declared_length > self.settings.max_bytes
+                ):
+                    raise ValueError(
+                        "Downloaded audio is too large. "
+                        f"Maximum: {self.settings.max_bytes} bytes."
+                    )
+
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in response.aiter_bytes(self._DOWNLOAD_CHUNK_BYTES):
+                    total += len(chunk)
+                    if total > self.settings.max_bytes:
+                        raise ValueError(
+                            "Downloaded audio is too large. "
+                            f"Maximum: {self.settings.max_bytes} bytes."
+                        )
+                    chunks.append(chunk)
+        except (ValueError, RuntimeError):
+            raise
+        except httpx.RequestError as exc:
+            raise RuntimeError("Could not download the Telegram audio file.") from exc
+
+        data = b"".join(chunks)
+        if not data:
+            raise ValueError("The downloaded audio file is empty.")
         return data
 
     async def _install_media(
@@ -265,7 +329,10 @@ class TelegramAudioController:
                 )
                 return
 
-        await self._safe_send_message(chat_id, "⏳ Downloading and validating the new website audio…")
+        await self._safe_send_message(
+            chat_id,
+            "⏳ Downloading and validating the new website audio…",
+        )
 
         data = await self._download(media)
         metadata = await self.store.replace(
@@ -277,14 +344,14 @@ class TelegramAudioController:
             telegram_update_id=telegram_update_id,
         )
 
-        size_mb = metadata.byte_length / (1024 * 1024)
+        size_mib = metadata.byte_length / (1024 * 1024)
         await self._safe_send_message(
             chat_id,
             (
                 "✅ Website audio updated successfully.\n\n"
                 f"File: {metadata.file_name}\n"
                 f"Type: {metadata.mime_type}\n"
-                f"Size: {size_mb:.2f} MB\n"
+                f"Size: {size_mib:.2f} MiB\n"
                 f"Version: {metadata.version}\n\n"
                 "The React website will detect the new version automatically."
             ),
@@ -294,28 +361,49 @@ class TelegramAudioController:
         try:
             metadata = await self.store.get_metadata(force=True)
         except AudioNotConfiguredError as exc:
-            await self._send_message(chat_id, f"⚠️ Audio storage is not configured: {exc}")
+            await self._send_message(
+                chat_id,
+                f"⚠️ Audio storage is not configured: {exc}",
+            )
             return
         except AudioStoreError:
-            await self._send_message(chat_id, "❌ Audio storage is temporarily unavailable.")
+            await self._send_message(
+                chat_id,
+                "❌ Audio storage is temporarily unavailable.",
+            )
             return
 
         if metadata is None:
-            await self._send_message(chat_id, "ℹ️ No Telegram-managed website audio is active yet.")
+            await self._send_message(
+                chat_id,
+                "ℹ️ No Telegram-managed website audio is active yet.",
+            )
             return
 
-        size_mb = metadata.byte_length / (1024 * 1024)
+        size_mib = metadata.byte_length / (1024 * 1024)
         await self._send_message(
             chat_id,
             (
                 "🎵 Current website audio\n\n"
                 f"File: {metadata.file_name}\n"
                 f"Type: {metadata.mime_type}\n"
-                f"Size: {size_mb:.2f} MB\n"
+                f"Size: {size_mib:.2f} MiB\n"
                 f"Version: {metadata.version}\n"
                 f"Updated: {metadata.updated_at}"
             ),
         )
+
+    async def _report_install_failure(
+        self,
+        chat_id: str,
+        key: tuple[str, int],
+        exc: Exception,
+        *,
+        keep_pending: bool,
+    ) -> None:
+        if keep_pending:
+            await self._set_pending(key)
+        await self._safe_send_message(chat_id, f"❌ Audio update failed: {exc}")
 
     async def handle_update(self, update: dict[str, Any]) -> bool:
         message = self._message(update)
@@ -334,7 +422,10 @@ class TelegramAudioController:
 
         if is_audio_command and not self._authorized(message):
             if chat_id == self.settings.telegram_chat_id:
-                await self._send_message(chat_id, "⛔ This command is restricted to audio administrators.")
+                await self._safe_send_message(
+                    chat_id,
+                    "⛔ This command is restricted to audio administrators.",
+                )
             return True
 
         if is_audio_command:
@@ -346,7 +437,9 @@ class TelegramAudioController:
                 cancelled = await self._cancel_pending(key)
                 await self._send_message(
                     chat_id,
-                    "✅ Pending audio update cancelled." if cancelled else "ℹ️ No pending audio update.",
+                    "✅ Pending audio update cancelled."
+                    if cancelled
+                    else "ℹ️ No pending audio update.",
                 )
                 return True
             if lowered in {"help", "?"}:
@@ -374,7 +467,12 @@ class TelegramAudioController:
                 try:
                     await self._install_media(message, media, telegram_update_id)
                 except (ValueError, AudioStoreError, RuntimeError) as exc:
-                    await self._send_message(chat_id, f"❌ Audio update failed: {exc}")
+                    await self._report_install_failure(
+                        chat_id,
+                        key,
+                        exc,
+                        keep_pending=True,
+                    )
                 return True
 
             await self._set_pending(key)
@@ -382,7 +480,7 @@ class TelegramAudioController:
                 chat_id,
                 (
                     "🎵 Send the new MP3, WAV, OGG, M4A, AAC, WebM, or FLAC file now.\n"
-                    f"Maximum size: {self.settings.max_bytes / (1024 * 1024):.1f} MB.\n"
+                    f"Maximum size: {self.settings.max_bytes / (1024 * 1024):.1f} MiB.\n"
                     "Use /audio cancel to stop."
                 ),
             )
@@ -400,5 +498,10 @@ class TelegramAudioController:
         try:
             await self._install_media(message, media, telegram_update_id)
         except (ValueError, AudioStoreError, RuntimeError) as exc:
-            await self._send_message(chat_id, f"❌ Audio update failed: {exc}")
+            await self._report_install_failure(
+                chat_id,
+                key,
+                exc,
+                keep_pending=True,
+            )
         return True
