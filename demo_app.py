@@ -30,8 +30,8 @@ app.add_middleware(
     allow_origins=list(get_backend_cors_origins()),
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Accept", "Content-Type", "X-Telegram-Bot-Api-Secret-Token"],
-    expose_headers=["ETag", "X-Audio-Version"],
+    allow_headers=["Accept", "Content-Type", "If-None-Match", "If-Range", "Range", "X-Telegram-Bot-Api-Secret-Token"],
+    expose_headers=["ETag", "X-Audio-Version", "Content-Length", "Content-Range", "Accept-Ranges"],
 )
 include_audio_router(app, api_prefix="/api")
 include_audio_telegram_webhook_router(app, api_prefix="/api")

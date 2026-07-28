@@ -6,6 +6,7 @@ import re
 from typing import Any
 
 _VERSION_RE = re.compile(r"^[A-Za-z0-9._-]{1,160}$")
+_KEY_VERSION_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _ALLOWED_MIME_TYPES = {
     "audio/mpeg",
@@ -16,6 +17,7 @@ _ALLOWED_MIME_TYPES = {
     "audio/webm",
     "audio/flac",
 }
+_ALLOWED_ENCRYPTION_ALGORITHMS = {"AES-256-GCM-CHUNKED"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,9 +32,15 @@ class AudioMetadata:
     uploaded_by: int | None = None
     telegram_file_id: str | None = None
     telegram_update_id: int | None = None
+    encrypted: bool = False
+    encryption_algorithm: str | None = None
+    encryption_key_version: str | None = None
+    encryption_chunk_bytes: int | None = None
+    ciphertext_byte_length: int | None = None
+    ciphertext_sha256: str | None = None
 
     def to_manifest(self) -> dict[str, Any]:
-        return {
+        value: dict[str, Any] = {
             "version": self.version,
             "fileName": self.file_name,
             "mimeType": self.mime_type,
@@ -43,7 +51,17 @@ class AudioMetadata:
             "uploadedBy": self.uploaded_by,
             "telegramFileId": self.telegram_file_id,
             "telegramUpdateId": self.telegram_update_id,
+            "encrypted": self.encrypted,
         }
+        if self.encrypted:
+            value["encryption"] = {
+                "algorithm": self.encryption_algorithm,
+                "keyVersion": self.encryption_key_version,
+                "chunkBytes": self.encryption_chunk_bytes,
+                "ciphertextByteLength": self.ciphertext_byte_length,
+                "ciphertextSha256": self.ciphertext_sha256,
+            }
+        return value
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
@@ -54,6 +72,7 @@ class AudioMetadata:
             "byteLength": self.byte_length,
             "sha256": self.sha256,
             "updatedAt": self.updated_at,
+            "encryptedAtRest": self.encrypted,
         }
 
     @classmethod
@@ -123,6 +142,45 @@ class AudioMetadata:
         if telegram_file_id is not None and len(telegram_file_id) > 512:
             raise ValueError("Audio manifest telegramFileId is invalid.")
 
+        encrypted = bool(value.get("encrypted", False))
+        encryption_algorithm: str | None = None
+        encryption_key_version: str | None = None
+        encryption_chunk_bytes: int | None = None
+        ciphertext_byte_length: int | None = None
+        ciphertext_sha256: str | None = None
+
+        if encrypted:
+            encryption = value.get("encryption")
+            if not isinstance(encryption, dict):
+                raise ValueError("Audio manifest encryption block is invalid.")
+            encryption_algorithm = str(encryption.get("algorithm") or "").strip()
+            encryption_key_version = str(
+                encryption.get("keyVersion") or ""
+            ).strip().lower()
+            ciphertext_sha256 = str(
+                encryption.get("ciphertextSha256") or ""
+            ).strip().lower()
+            try:
+                encryption_chunk_bytes = int(encryption.get("chunkBytes") or 0)
+                ciphertext_byte_length = int(
+                    encryption.get("ciphertextByteLength") or 0
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Audio manifest encryption sizes are invalid.") from exc
+
+            if encryption_algorithm not in _ALLOWED_ENCRYPTION_ALGORITHMS:
+                raise ValueError("Audio manifest encryption algorithm is invalid.")
+            if not _KEY_VERSION_RE.fullmatch(encryption_key_version):
+                raise ValueError("Audio manifest encryption keyVersion is invalid.")
+            if not 64 * 1024 <= encryption_chunk_bytes <= 4 * 1024 * 1024:
+                raise ValueError("Audio manifest encryption chunkBytes is invalid.")
+            if ciphertext_byte_length <= byte_length:
+                raise ValueError(
+                    "Audio manifest ciphertextByteLength must exceed byteLength."
+                )
+            if not _SHA256_RE.fullmatch(ciphertext_sha256):
+                raise ValueError("Audio manifest ciphertextSha256 is invalid.")
+
         return cls(
             version=version,
             file_name=file_name,
@@ -134,4 +192,42 @@ class AudioMetadata:
             uploaded_by=uploaded_by,
             telegram_file_id=telegram_file_id,
             telegram_update_id=telegram_update_id,
+            encrypted=encrypted,
+            encryption_algorithm=encryption_algorithm,
+            encryption_key_version=encryption_key_version,
+            encryption_chunk_bytes=encryption_chunk_bytes,
+            ciphertext_byte_length=ciphertext_byte_length,
+            ciphertext_sha256=ciphertext_sha256,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class AudioHistory:
+    items: tuple[AudioMetadata, ...]
+
+    def to_manifest(self) -> dict[str, Any]:
+        return {
+            "formatVersion": 1,
+            "items": [item.to_manifest() for item in self.items],
+        }
+
+    @classmethod
+    def from_manifest(cls, value: dict[str, Any], *, limit: int) -> "AudioHistory":
+        if value.get("formatVersion") != 1:
+            raise ValueError("Audio history formatVersion is invalid.")
+        raw_items = value.get("items")
+        if not isinstance(raw_items, list):
+            raise ValueError("Audio history items are invalid.")
+        if len(raw_items) > max(limit, 100):
+            raise ValueError("Audio history contains too many entries.")
+        items: list[AudioMetadata] = []
+        seen: set[str] = set()
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                raise ValueError("Audio history item is invalid.")
+            item = AudioMetadata.from_manifest(raw)
+            if item.version in seen:
+                raise ValueError("Audio history contains duplicate versions.")
+            seen.add(item.version)
+            items.append(item)
+        return cls(tuple(items[:limit]))

@@ -11,7 +11,12 @@ import httpx
 
 from .audio_validation import mime_from_file_name, normalize_mime_type
 from .config import AudioSettings
-from .store import AudioNotConfiguredError, AudioStore, AudioStoreError
+from .store import (
+    AudioHistorySelectionError,
+    AudioNotConfiguredError,
+    AudioStore,
+    AudioStoreError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -389,7 +394,88 @@ class TelegramAudioController:
                 f"Type: {metadata.mime_type}\n"
                 f"Size: {size_mib:.2f} MiB\n"
                 f"Version: {metadata.version}\n"
-                f"Updated: {metadata.updated_at}"
+                f"Updated: {metadata.updated_at}\n"
+                f"Encrypted at rest: {'Yes' if metadata.encrypted else 'No'}\n"
+                f"Key version: {metadata.encryption_key_version or 'legacy'}"
+            ),
+        )
+
+    async def _send_history(self, chat_id: str) -> None:
+        try:
+            current = await self.store.get_metadata(force=True)
+            history = await self.store.get_history(force=True)
+        except AudioNotConfiguredError as exc:
+            await self._send_message(
+                chat_id,
+                f"⚠️ Audio storage is not configured: {exc}",
+            )
+            return
+        except AudioStoreError:
+            await self._send_message(
+                chat_id,
+                "❌ Audio history is temporarily unavailable.",
+            )
+            return
+
+        if not history.items:
+            await self._send_message(chat_id, "ℹ️ Audio history is empty.")
+            return
+
+        lines = ["🗂 Website audio history", ""]
+        for index, item in enumerate(history.items, start=1):
+            marker = "▶️" if current and item.version == current.version else "▫️"
+            encryption = (
+                f"encrypted/{item.encryption_key_version}"
+                if item.encrypted
+                else "legacy plaintext"
+            )
+            size_mib = item.byte_length / (1024 * 1024)
+            lines.extend(
+                [
+                    f"{marker} {index}. {item.file_name}",
+                    f"   {size_mib:.2f} MiB · {encryption}",
+                    f"   {item.version}",
+                ]
+            )
+        lines.extend(
+            [
+                "",
+                "Rollback with /audio rollback <number>",
+                "or /audio rollback <version>.",
+            ]
+        )
+        await self._send_message(chat_id, "\n".join(lines))
+
+    async def _rollback(self, chat_id: str, selector: str) -> None:
+        try:
+            metadata = await self.store.rollback(selector)
+        except AudioHistorySelectionError as exc:
+            await self._send_message(chat_id, f"⚠️ {exc}")
+            return
+        except AudioNotConfiguredError as exc:
+            await self._send_message(
+                chat_id,
+                f"⚠️ Audio storage is not configured: {exc}",
+            )
+            return
+        except AudioStoreError as exc:
+            logger.warning(
+                "Audio rollback failed code=%s",
+                exc.code,
+            )
+            await self._send_message(
+                chat_id,
+                "❌ Audio rollback failed because storage or validation is unavailable.",
+            )
+            return
+
+        await self._send_message(
+            chat_id,
+            (
+                "✅ Website audio rolled back successfully.\n\n"
+                f"File: {metadata.file_name}\n"
+                f"Version: {metadata.version}\n"
+                f"Encryption key: {metadata.encryption_key_version or 'legacy'}"
             ),
         )
 
@@ -430,8 +516,23 @@ class TelegramAudioController:
 
         if is_audio_command:
             lowered = argument.lower()
+            option, _, option_argument = argument.partition(" ")
+            option = option.lower().strip()
+            option_argument = option_argument.strip()
             if lowered in {"status", "info"}:
                 await self._send_status(chat_id)
+                return True
+            if lowered in {"history", "versions"}:
+                await self._send_history(chat_id)
+                return True
+            if option == "rollback":
+                if not option_argument:
+                    await self._send_message(
+                        chat_id,
+                        "⚠️ Use /audio rollback <history number or version>.",
+                    )
+                else:
+                    await self._rollback(chat_id, option_argument)
                 return True
             if lowered == "cancel":
                 cancelled = await self._cancel_pending(key)
@@ -449,6 +550,8 @@ class TelegramAudioController:
                         "Audio commands:\n"
                         "/audio — wait for your next audio file\n"
                         "/audio status — show the active file\n"
+                        "/audio history — list encrypted versions\n"
+                        "/audio rollback 2 — activate a previous version\n"
                         "/audio cancel — cancel the pending upload\n\n"
                         "You can also send an audio/document with caption /audio, "
                         "or reply /audio to an existing audio message."

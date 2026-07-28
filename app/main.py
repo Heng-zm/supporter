@@ -25,7 +25,7 @@ from app.services.visit_crypto import VisitCryptoService
 from app.services.visits import VisitService
 
 
-APP_VERSION = "2.2.0-audio"
+APP_VERSION = "2.3.0-audio"
 
 
 def _unique_origins(*origin_groups: list[str] | tuple[str, ...]) -> list[str]:
@@ -98,6 +98,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "X-Admin-Key",
             "X-Telegram-Bot-Api-Secret-Token",
             "If-None-Match",
+            "If-Range",
+            "Range",
         ],
         expose_headers=[
             "X-Supporters-Source",
@@ -105,6 +107,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "ETag",
             "X-Audio-Version",
             "Content-Length",
+            "Content-Range",
+            "Accept-Ranges",
         ],
         max_age=600,
     )
@@ -150,6 +154,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "audioExtensionInitialized": audio_store is not None,
             "audioStorageMode": getattr(audio_store, "mode", None),
             "audioStorageReady": getattr(audio_store, "storage_ready", False),
+            "audioEncryptionEnabled": bool(
+                getattr(audio_settings, "encryption_enabled", False)
+            ),
+            "audioEncryptionActiveKeyVersion": getattr(
+                audio_settings, "encryption_active_key_version", None
+            ),
             "audioStorageErrorCode": audio_storage_error_code,
             "audioConfigurationValid": not bool(
                 getattr(

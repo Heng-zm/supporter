@@ -31,6 +31,7 @@ def settings(tmp_path: Path) -> AudioSettings:
         storage_mode="local",
         storage_bucket="website-audio",
         storage_manifest_path="current.json",
+        history_manifest_path="history.json",
         local_storage_directory=tmp_path,
         max_bytes=20_000_000,
         metadata_cache_seconds=0,
@@ -44,6 +45,14 @@ def settings(tmp_path: Path) -> AudioSettings:
         telegram_allow_owner_private_chat=True,
         app_environment="test",
         require_persistent_storage=False,
+        encryption_enabled=True,
+        encryption_algorithm="AES-256-GCM-CHUNKED",
+        encryption_active_key_version="v1",
+        encryption_chunk_bytes=64 * 1024,
+        encryption_keys={"v1": b"K" * 32},
+        history_limit=10,
+        range_requests_enabled=True,
+        response_chunk_bytes=64 * 1024,
     )
 
 
@@ -422,7 +431,8 @@ def test_supabase_bucket_is_created_automatically(tmp_path: Path) -> None:
             assert store.storage_ready is True
             assert create_payload["id"] == "website-audio"
             assert create_payload["public"] is False
-            assert create_payload["file_size_limit"] == 20_000_000
+            assert create_payload["file_size_limit"] == cfg.max_ciphertext_bytes
+            assert "application/octet-stream" in create_payload["allowed_mime_types"]
 
     asyncio.run(run())
 
@@ -1021,3 +1031,467 @@ def test_anon_supabase_key_is_rejected_before_network(monkeypatch) -> None:
 
     cfg = AudioSettings.from_env()
     assert 'role "anon"' in cfg.configuration_error
+
+
+def test_encrypted_storage_contains_no_plaintext_and_validates_hashes(tmp_path: Path) -> None:
+    async def run() -> None:
+        source = make_wav() + b"\x01\x02\x03\x04" * 40_000
+        cfg = settings(tmp_path)
+        async with httpx.AsyncClient() as client:
+            writer = AudioStore(cfg, client)
+            metadata = await writer.replace(
+                file_name="secret.wav",
+                mime_type="audio/wav",
+                data=source,
+                uploaded_by=200,
+                telegram_file_id="encrypted-file",
+                telegram_update_id=901,
+            )
+
+            assert metadata.encrypted is True
+            assert metadata.encryption_algorithm == "AES-256-GCM-CHUNKED"
+            assert metadata.encryption_key_version == "v1"
+            assert metadata.ciphertext_byte_length is not None
+            assert metadata.ciphertext_byte_length > metadata.byte_length
+            assert metadata.ciphertext_sha256 is not None
+            assert metadata.object_path.endswith(".agcm")
+
+            encrypted_bytes = (tmp_path / metadata.object_path).read_bytes()
+            assert encrypted_bytes.startswith(b"RAAEGCM1")
+            assert not encrypted_bytes.startswith(b"RIFF")
+            assert source[:128] not in encrypted_bytes
+            assert __import__("hashlib").sha256(encrypted_bytes).hexdigest() == (
+                metadata.ciphertext_sha256
+            )
+
+            # A new store instance cannot use the plaintext cache from replace().
+            reader = AudioStore(cfg, client)
+            loaded_metadata, loaded = await reader.get_audio(
+                requested_version=metadata.version
+            )
+            assert loaded_metadata.sha256 == __import__("hashlib").sha256(source).hexdigest()
+            assert loaded == source
+
+    asyncio.run(run())
+
+
+def test_encrypted_ciphertext_tampering_is_rejected(tmp_path: Path) -> None:
+    from app.audio_extension.store import AudioStoreError
+
+    async def run() -> None:
+        source = make_wav() + b"A" * 100_000
+        cfg = settings(tmp_path)
+        async with httpx.AsyncClient() as client:
+            writer = AudioStore(cfg, client)
+            metadata = await writer.replace(
+                file_name="tamper.wav",
+                mime_type="audio/wav",
+                data=source,
+                uploaded_by=200,
+                telegram_file_id=None,
+                telegram_update_id=None,
+            )
+            path = tmp_path / metadata.object_path
+            damaged = bytearray(path.read_bytes())
+            damaged[-20] ^= 0x01
+            path.write_bytes(damaged)
+
+            reader = AudioStore(cfg, client)
+            try:
+                await reader.get_audio(requested_version=metadata.version)
+            except AudioStoreError as exc:
+                assert exc.code in {
+                    "encrypted_audio_authentication_failed",
+                    "encrypted_audio_checksum_mismatch",
+                }
+            else:
+                raise AssertionError("Tampered encrypted audio should be rejected.")
+
+    asyncio.run(run())
+
+
+def test_per_file_nonce_produces_different_ciphertext(tmp_path: Path) -> None:
+    async def run() -> None:
+        source = make_wav() + b"B" * 80_000
+        cfg = settings(tmp_path)
+        async with httpx.AsyncClient() as client:
+            store = AudioStore(cfg, client)
+            first = await store.replace(
+                file_name="same.wav",
+                mime_type="audio/wav",
+                data=source,
+                uploaded_by=200,
+                telegram_file_id="one",
+                telegram_update_id=1001,
+            )
+            second = await store.replace(
+                file_name="same.wav",
+                mime_type="audio/wav",
+                data=source,
+                uploaded_by=200,
+                telegram_file_id="two",
+                telegram_update_id=1002,
+            )
+            first_bytes = (tmp_path / first.object_path).read_bytes()
+            second_bytes = (tmp_path / second.object_path).read_bytes()
+            assert first.sha256 == second.sha256
+            assert first.ciphertext_sha256 != second.ciphertext_sha256
+            assert first_bytes != second_bytes
+
+    asyncio.run(run())
+
+
+def test_key_rotation_reads_old_versions_and_encrypts_new_version(tmp_path: Path) -> None:
+    from app.audio_extension.store import AudioStoreError
+
+    async def run() -> None:
+        source_v1 = make_wav() + b"V1" * 40_000
+        source_v2 = make_wav() + b"V2" * 50_000
+        cfg_v1 = settings(tmp_path)
+
+        async with httpx.AsyncClient() as client:
+            first_store = AudioStore(cfg_v1, client)
+            first = await first_store.replace(
+                file_name="v1.wav",
+                mime_type="audio/wav",
+                data=source_v1,
+                uploaded_by=200,
+                telegram_file_id=None,
+                telegram_update_id=1101,
+            )
+
+            cfg_v2 = replace(
+                cfg_v1,
+                encryption_active_key_version="v2",
+                encryption_keys={"v1": b"K" * 32, "v2": b"Z" * 32},
+            )
+            rotated_store = AudioStore(cfg_v2, client)
+            old_metadata, old_audio = await rotated_store.get_audio(
+                requested_version=first.version
+            )
+            assert old_metadata.encryption_key_version == "v1"
+            assert old_audio == source_v1
+
+            second = await rotated_store.replace(
+                file_name="v2.wav",
+                mime_type="audio/wav",
+                data=source_v2,
+                uploaded_by=200,
+                telegram_file_id=None,
+                telegram_update_id=1102,
+            )
+            assert second.encryption_key_version == "v2"
+
+            rolled_back = await rotated_store.rollback("2")
+            assert rolled_back.version == first.version
+            _, restored = await rotated_store.get_audio()
+            assert restored == source_v1
+
+            cfg_without_old_key = replace(
+                cfg_v2,
+                encryption_keys={"v2": b"Z" * 32},
+            )
+            missing_key_store = AudioStore(cfg_without_old_key, client)
+            try:
+                await missing_key_store.get_audio()
+            except AudioStoreError as exc:
+                assert exc.code == "audio_decryption_key_unavailable"
+            else:
+                raise AssertionError("Old encrypted audio must require its old key.")
+
+    asyncio.run(run())
+
+
+def test_encrypted_history_and_telegram_rollback(tmp_path: Path) -> None:
+    async def run() -> None:
+        sent_messages: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/sendMessage"):
+                payload = __import__("json").loads(request.content)
+                sent_messages.append(payload["text"])
+                return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+            return httpx.Response(404)
+
+        cfg = settings(tmp_path)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            store = AudioStore(cfg, client)
+            first_source = make_wav() + b"1" * 70_000
+            second_source = make_wav() + b"2" * 70_000
+            first = await store.replace(
+                file_name="first.wav",
+                mime_type="audio/wav",
+                data=first_source,
+                uploaded_by=200,
+                telegram_file_id=None,
+                telegram_update_id=1201,
+            )
+            await store.replace(
+                file_name="second.wav",
+                mime_type="audio/wav",
+                data=second_source,
+                uploaded_by=200,
+                telegram_file_id=None,
+                telegram_update_id=1202,
+            )
+
+            controller = TelegramAudioController(cfg, client, store)
+            history_update = {
+                "update_id": 1203,
+                "message": {
+                    "chat": {"id": 100, "type": "group"},
+                    "from": {"id": 200},
+                    "text": "/audio history",
+                },
+            }
+            rollback_update = {
+                "update_id": 1204,
+                "message": {
+                    "chat": {"id": 100, "type": "group"},
+                    "from": {"id": 200},
+                    "text": "/audio rollback 2",
+                },
+            }
+            assert await controller.handle_update(history_update) is True
+            assert await controller.handle_update(rollback_update) is True
+            active = await store.get_metadata(force=True)
+            assert active is not None and active.version == first.version
+            _, restored = await store.get_audio()
+            assert restored == first_source
+            assert any("audio history" in text.lower() for text in sent_messages)
+            assert any("rolled back successfully" in text.lower() for text in sent_messages)
+
+    asyncio.run(run())
+
+
+def test_encrypted_streaming_range_response(tmp_path: Path) -> None:
+    from fastapi import FastAPI
+    from app.audio_extension.router import router
+
+    async def run() -> None:
+        source = make_wav() + bytes(range(256)) * 1_000
+        cfg = settings(tmp_path)
+        async with httpx.AsyncClient() as storage_client:
+            store = AudioStore(cfg, storage_client)
+            metadata = await store.replace(
+                file_name="range.wav",
+                mime_type="audio/wav",
+                data=source,
+                uploaded_by=200,
+                telegram_file_id=None,
+                telegram_update_id=1301,
+            )
+
+            app = FastAPI()
+            app.state.audio_store = AudioStore(cfg, storage_client)
+            app.include_router(router, prefix="/api")
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://test",
+            ) as client:
+                response = await client.get(
+                    "/api/audio/file",
+                    params={"version": metadata.version},
+                    headers={"Range": "bytes=1000-79999"},
+                )
+                assert response.status_code == 206
+                assert response.content == source[1000:80000]
+                assert response.headers["content-range"] == (
+                    f"bytes 1000-79999/{len(source)}"
+                )
+                assert response.headers["accept-ranges"] == "bytes"
+                assert int(response.headers["content-length"]) == 79_000
+
+                suffix = await client.get(
+                    "/api/audio/file",
+                    params={"version": metadata.version},
+                    headers={"Range": "bytes=-128"},
+                )
+                assert suffix.status_code == 206
+                assert suffix.content == source[-128:]
+
+                invalid = await client.get(
+                    "/api/audio/file",
+                    params={"version": metadata.version},
+                    headers={"Range": f"bytes={len(source)}-"},
+                )
+                assert invalid.status_code == 416
+                assert invalid.headers["content-range"] == f"bytes */{len(source)}"
+
+    asyncio.run(run())
+
+
+def test_decrypted_output_limit_is_enforced(tmp_path: Path) -> None:
+    from app.audio_extension.store import AudioStoreError
+
+    async def run() -> None:
+        source = make_wav() + b"L" * 100_000
+        cfg = settings(tmp_path)
+        async with httpx.AsyncClient() as client:
+            writer = AudioStore(cfg, client)
+            metadata = await writer.replace(
+                file_name="limit.wav",
+                mime_type="audio/wav",
+                data=source,
+                uploaded_by=200,
+                telegram_file_id=None,
+                telegram_update_id=1401,
+            )
+            smaller_cfg = replace(cfg, max_bytes=len(source) - 1)
+            reader = AudioStore(smaller_cfg, client)
+            try:
+                await reader.get_audio(requested_version=metadata.version)
+            except AudioStoreError as exc:
+                assert exc.code in {"stored_audio_too_large", "decrypted_audio_too_large"}
+            else:
+                raise AssertionError("Decrypted output larger than max_bytes must fail.")
+
+    asyncio.run(run())
+
+
+def test_failed_remote_upload_triggers_orphan_cleanup(tmp_path: Path) -> None:
+    from app.audio_extension.store import AudioStoreError
+
+    async def run() -> None:
+        deleted_paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/storage/v1/bucket/website-audio"):
+                return httpx.Response(200, json={"id": "website-audio"})
+            prefix = "https://project.supabase.co/storage/v1/object/website-audio/"
+            if url.startswith(prefix):
+                path = url[len(prefix):]
+                if request.method == "POST" and path.startswith("versions/"):
+                    # Simulate a remote failure after the server accepted bytes.
+                    return httpx.Response(500, json={"message": "upload failed"})
+                if request.method == "DELETE":
+                    deleted_paths.append(path)
+                    return httpx.Response(200, json={"message": "deleted"})
+                if request.method == "GET":
+                    return httpx.Response(
+                        400,
+                        json={
+                            "statusCode": "404",
+                            "error": "not_found",
+                            "message": "Object not found",
+                        },
+                    )
+            return httpx.Response(404)
+
+        cfg = replace(
+            settings(tmp_path),
+            storage_mode="supabase",
+            supabase_url="https://project.supabase.co",
+            supabase_secret_key="service-key",
+        )
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            store = AudioStore(cfg, client)
+            try:
+                await store.replace(
+                    file_name="cleanup.wav",
+                    mime_type="audio/wav",
+                    data=make_wav(),
+                    uploaded_by=200,
+                    telegram_file_id=None,
+                    telegram_update_id=1501,
+                )
+            except AudioStoreError as exc:
+                assert exc.code == "supabase_storage_request_failed"
+            else:
+                raise AssertionError("Remote upload failure should be reported.")
+            assert len(deleted_paths) == 1
+            assert deleted_paths[0].startswith("versions/")
+
+    asyncio.run(run())
+
+
+def test_environment_loads_multiple_encryption_key_versions(monkeypatch) -> None:
+    import base64
+
+    monkeypatch.setenv("AUDIO_ENCRYPTION_KEY_V1", base64.b64encode(b"1" * 32).decode())
+    monkeypatch.setenv("AUDIO_ENCRYPTION_KEY_V2", base64.b64encode(b"2" * 32).decode())
+    cfg = AudioSettings.from_env()
+    assert cfg.encryption_keys["v1"] == b"1" * 32
+    assert cfg.encryption_keys["v2"] == b"2" * 32
+    assert cfg.active_encryption_key == b"1" * 32
+
+
+def test_history_limit_deletes_pruned_encrypted_objects(tmp_path: Path) -> None:
+    async def run() -> None:
+        cfg = replace(settings(tmp_path), history_limit=2)
+        async with httpx.AsyncClient() as client:
+            store = AudioStore(cfg, client)
+            first = await store.replace(
+                file_name="one.wav",
+                mime_type="audio/wav",
+                data=make_wav() + b"1" * 10_000,
+                uploaded_by=200,
+                telegram_file_id=None,
+                telegram_update_id=1601,
+            )
+            second = await store.replace(
+                file_name="two.wav",
+                mime_type="audio/wav",
+                data=make_wav() + b"2" * 10_000,
+                uploaded_by=200,
+                telegram_file_id=None,
+                telegram_update_id=1602,
+            )
+            third = await store.replace(
+                file_name="three.wav",
+                mime_type="audio/wav",
+                data=make_wav() + b"3" * 10_000,
+                uploaded_by=200,
+                telegram_file_id=None,
+                telegram_update_id=1603,
+            )
+            history = await store.get_history(force=True)
+            assert [item.version for item in history.items] == [
+                third.version,
+                second.version,
+            ]
+            assert not (tmp_path / first.object_path).exists()
+            assert (tmp_path / second.object_path).is_file()
+            assert (tmp_path / third.object_path).is_file()
+
+    asyncio.run(run())
+
+
+def test_if_range_mismatch_returns_full_encrypted_audio(tmp_path: Path) -> None:
+    from fastapi import FastAPI
+    from app.audio_extension.router import router
+
+    async def run() -> None:
+        source = make_wav() + b"R" * 100_000
+        cfg = settings(tmp_path)
+        async with httpx.AsyncClient() as storage_client:
+            store = AudioStore(cfg, storage_client)
+            metadata = await store.replace(
+                file_name="if-range.wav",
+                mime_type="audio/wav",
+                data=source,
+                uploaded_by=200,
+                telegram_file_id=None,
+                telegram_update_id=1701,
+            )
+            app = FastAPI()
+            app.state.audio_store = AudioStore(cfg, storage_client)
+            app.include_router(router, prefix="/api")
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://test",
+            ) as client:
+                response = await client.get(
+                    "/api/audio/file",
+                    params={"version": metadata.version},
+                    headers={
+                        "Range": "bytes=10-99",
+                        "If-Range": '"different-version"',
+                    },
+                )
+                assert response.status_code == 200
+                assert response.content == source
+                assert "content-range" not in response.headers
+
+    asyncio.run(run())

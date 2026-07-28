@@ -5,22 +5,35 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
-from typing import Any
+import re
+from types import MappingProxyType
+from typing import Any, Mapping
 
 from .source_settings import (
     AUDIO_AUTO_CREATE_BUCKET,
     AUDIO_ENABLED,
+    AUDIO_ENCRYPTION_ACTIVE_KEY_VERSION,
+    AUDIO_ENCRYPTION_ALGORITHM,
+    AUDIO_ENCRYPTION_CHUNK_BYTES,
+    AUDIO_ENCRYPTION_ENABLED,
+    AUDIO_HISTORY_LIMIT,
+    AUDIO_HISTORY_MANIFEST_PATH,
     AUDIO_HTTP_TIMEOUT_SECONDS,
     AUDIO_LOCAL_STORAGE_DIRECTORY,
     AUDIO_MAX_BYTES,
     AUDIO_METADATA_CACHE_SECONDS,
     AUDIO_PENDING_TTL_SECONDS,
+    AUDIO_RANGE_REQUESTS_ENABLED,
     AUDIO_REQUIRE_PERSISTENT_STORAGE,
+    AUDIO_RESPONSE_CHUNK_BYTES,
     AUDIO_STORAGE_BUCKET,
     AUDIO_STORAGE_MANIFEST_PATH,
     AUDIO_STORAGE_MODE,
     AUDIO_TELEGRAM_ALLOW_OWNER_PRIVATE_CHAT,
 )
+
+_KEY_VERSION_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+_ENCRYPTION_ENV_PREFIX = "AUDIO_ENCRYPTION_KEY_"
 
 
 def _parse_admin_ids(raw: str) -> frozenset[int]:
@@ -80,6 +93,31 @@ def _supabase_key_error(key: str) -> str:
     return ""
 
 
+def _decode_encryption_key(raw: str, env_name: str) -> bytes:
+    try:
+        value = base64.b64decode(raw.strip(), validate=True)
+    except (ValueError, base64.binascii.Error) as exc:
+        raise ValueError(f"{env_name} must be valid standard Base64.") from exc
+    if len(value) != 32:
+        raise ValueError(f"{env_name} must decode to exactly 32 bytes.")
+    return value
+
+
+def _load_encryption_keys() -> Mapping[str, bytes]:
+    values: dict[str, bytes] = {}
+    for env_name, raw in os.environ.items():
+        if not env_name.startswith(_ENCRYPTION_ENV_PREFIX) or not raw.strip():
+            continue
+        suffix = env_name[len(_ENCRYPTION_ENV_PREFIX) :].strip().lower()
+        if not _KEY_VERSION_RE.fullmatch(suffix):
+            raise ValueError(
+                f"{env_name} has an invalid key version suffix. "
+                "Use letters, numbers, dot, underscore, or hyphen."
+            )
+        values[suffix] = _decode_encryption_key(raw, env_name)
+    return MappingProxyType(values)
+
+
 def _validate_source_settings() -> None:
     if AUDIO_STORAGE_MODE not in {"auto", "supabase", "local"}:
         raise ValueError(
@@ -87,10 +125,15 @@ def _validate_source_settings() -> None:
         )
     if not AUDIO_STORAGE_BUCKET.strip():
         raise ValueError("AUDIO_STORAGE_BUCKET in source_settings.py cannot be empty.")
-    if not AUDIO_STORAGE_MANIFEST_PATH.strip().lstrip("/"):
-        raise ValueError(
-            "AUDIO_STORAGE_MANIFEST_PATH in source_settings.py cannot be empty."
-        )
+    for name, value in (
+        ("AUDIO_STORAGE_MANIFEST_PATH", AUDIO_STORAGE_MANIFEST_PATH),
+        ("AUDIO_HISTORY_MANIFEST_PATH", AUDIO_HISTORY_MANIFEST_PATH),
+    ):
+        clean = value.strip().lstrip("/")
+        if not clean or clean.startswith("versions/") or ".." in clean.split("/"):
+            raise ValueError(f"{name} in source_settings.py is invalid.")
+    if AUDIO_STORAGE_MANIFEST_PATH == AUDIO_HISTORY_MANIFEST_PATH:
+        raise ValueError("Current and history manifest paths must be different.")
     if not 1_024 <= AUDIO_MAX_BYTES <= 20_000_000:
         raise ValueError(
             "AUDIO_MAX_BYTES in source_settings.py must be between 1024 and 20000000."
@@ -107,6 +150,20 @@ def _validate_source_settings() -> None:
         raise ValueError(
             "AUDIO_HTTP_TIMEOUT_SECONDS in source_settings.py must be between 10 and 180."
         )
+    if AUDIO_ENCRYPTION_ALGORITHM != "AES-256-GCM-CHUNKED":
+        raise ValueError("Only AES-256-GCM-CHUNKED is supported.")
+    if not _KEY_VERSION_RE.fullmatch(AUDIO_ENCRYPTION_ACTIVE_KEY_VERSION):
+        raise ValueError("AUDIO_ENCRYPTION_ACTIVE_KEY_VERSION is invalid.")
+    if not 64 * 1024 <= AUDIO_ENCRYPTION_CHUNK_BYTES <= 4 * 1024 * 1024:
+        raise ValueError(
+            "AUDIO_ENCRYPTION_CHUNK_BYTES must be between 65536 and 4194304."
+        )
+    if not 1 <= AUDIO_HISTORY_LIMIT <= 100:
+        raise ValueError("AUDIO_HISTORY_LIMIT must be between 1 and 100.")
+    if not 16 * 1024 <= AUDIO_RESPONSE_CHUNK_BYTES <= 1024 * 1024:
+        raise ValueError(
+            "AUDIO_RESPONSE_CHUNK_BYTES must be between 16384 and 1048576."
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +172,7 @@ class AudioSettings:
     storage_mode: str
     storage_bucket: str
     storage_manifest_path: str
+    history_manifest_path: str
     local_storage_directory: Path
     max_bytes: int
     metadata_cache_seconds: int
@@ -129,10 +187,18 @@ class AudioSettings:
     app_environment: str
     require_persistent_storage: bool
     auto_create_bucket: bool = True
+    encryption_enabled: bool = True
+    encryption_algorithm: str = "AES-256-GCM-CHUNKED"
+    encryption_active_key_version: str = "v1"
+    encryption_chunk_bytes: int = 1_048_576
+    encryption_keys: Mapping[str, bytes] = MappingProxyType({})
+    history_limit: int = 10
+    range_requests_enabled: bool = True
+    response_chunk_bytes: int = 64 * 1024
 
     @classmethod
     def from_env(cls) -> "AudioSettings":
-        """Load secrets from the environment and non-secret settings from source."""
+        """Load secrets from environment and non-secret settings from source."""
         _validate_source_settings()
 
         environment = os.getenv("APP_ENVIRONMENT", "development").strip().lower()
@@ -143,6 +209,7 @@ class AudioSettings:
             storage_mode=mode,
             storage_bucket=AUDIO_STORAGE_BUCKET.strip(),
             storage_manifest_path=AUDIO_STORAGE_MANIFEST_PATH.strip().lstrip("/"),
+            history_manifest_path=AUDIO_HISTORY_MANIFEST_PATH.strip().lstrip("/"),
             local_storage_directory=Path(AUDIO_LOCAL_STORAGE_DIRECTORY).expanduser(),
             max_bytes=AUDIO_MAX_BYTES,
             metadata_cache_seconds=AUDIO_METADATA_CACHE_SECONDS,
@@ -168,6 +235,16 @@ class AudioSettings:
             app_environment=environment,
             require_persistent_storage=AUDIO_REQUIRE_PERSISTENT_STORAGE,
             auto_create_bucket=AUDIO_AUTO_CREATE_BUCKET,
+            encryption_enabled=AUDIO_ENCRYPTION_ENABLED,
+            encryption_algorithm=AUDIO_ENCRYPTION_ALGORITHM,
+            encryption_active_key_version=(
+                AUDIO_ENCRYPTION_ACTIVE_KEY_VERSION.strip().lower()
+            ),
+            encryption_chunk_bytes=AUDIO_ENCRYPTION_CHUNK_BYTES,
+            encryption_keys=_load_encryption_keys(),
+            history_limit=AUDIO_HISTORY_LIMIT,
+            range_requests_enabled=AUDIO_RANGE_REQUESTS_ENABLED,
+            response_chunk_bytes=AUDIO_RESPONSE_CHUNK_BYTES,
         )
 
     @property
@@ -181,13 +258,25 @@ class AudioSettings:
         return self.storage_mode
 
     @property
+    def active_encryption_key(self) -> bytes | None:
+        return self.encryption_keys.get(self.encryption_active_key_version)
+
+    @property
+    def max_ciphertext_bytes(self) -> int:
+        # Header allowance plus 4-byte length and 16-byte GCM tag per chunk.
+        chunks = (self.max_bytes + self.encryption_chunk_bytes - 1) // (
+            self.encryption_chunk_bytes
+        )
+        return self.max_bytes + chunks * 20 + 64 * 1024
+
+    @property
     def configuration_error(self) -> str:
         if not self.enabled:
             return "Audio management is disabled."
         if not self.storage_bucket:
             return "AUDIO_STORAGE_BUCKET is empty."
-        if not self.storage_manifest_path:
-            return "AUDIO_STORAGE_MANIFEST_PATH is empty."
+        if not self.storage_manifest_path or not self.history_manifest_path:
+            return "Audio manifest paths are empty."
         if self.resolved_storage_mode == "supabase" and not self.supabase_configured:
             return "Supabase audio storage is selected but Supabase is not configured."
         if self.resolved_storage_mode == "supabase":
@@ -198,4 +287,15 @@ class AudioSettings:
             return (
                 "Persistent audio storage is required, but Supabase Storage is not configured."
             )
+        if self.encryption_enabled:
+            if self.encryption_algorithm != "AES-256-GCM-CHUNKED":
+                return "The configured audio encryption algorithm is unsupported."
+            if self.active_encryption_key is None:
+                env_name = (
+                    _ENCRYPTION_ENV_PREFIX
+                    + self.encryption_active_key_version.upper()
+                )
+                return f"Missing active audio encryption key: {env_name}."
+            if any(len(key) != 32 for key in self.encryption_keys.values()):
+                return "Every audio encryption key must be exactly 32 bytes."
         return ""
