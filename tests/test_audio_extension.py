@@ -358,3 +358,77 @@ def test_audio_settings_are_stored_in_source(monkeypatch) -> None:
     assert cfg.http_timeout_seconds == 60
     assert cfg.require_persistent_storage is True
     assert cfg.telegram_allow_owner_private_chat is True
+
+
+
+def test_source_controlled_cors_origins(monkeypatch) -> None:
+    from app.audio_extension.cors import get_backend_cors_origins
+
+    monkeypatch.setenv(
+        "BACKEND_CORS_ORIGINS",
+        "https://wrong.example,https://also-wrong.example",
+    )
+
+    assert get_backend_cors_origins() == (
+        "https://pay-coffee-topaz.vercel.app",
+        "https://j-s-ng-o-rgn-sz-lrgkldgs.vercel.app",
+    )
+
+
+def test_cors_preflight_allows_both_frontends() -> None:
+    from fastapi import FastAPI
+    from fastapi.middleware.cors import CORSMiddleware
+
+    from app.audio_extension.cors import get_backend_cors_origins
+
+    async def run() -> None:
+        app = FastAPI()
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(get_backend_cors_origins()),
+            allow_credentials=False,
+            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_headers=["Accept", "Content-Type"],
+        )
+
+        @app.get("/health")
+        async def health() -> dict[str, bool]:
+            return {"ok": True}
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            for origin in get_backend_cors_origins():
+                response = await client.options(
+                    "/health",
+                    headers={
+                        "Origin": origin,
+                        "Access-Control-Request-Method": "GET",
+                    },
+                )
+                assert response.status_code == 200
+                assert response.headers["access-control-allow-origin"] == origin
+
+            denied = await client.options(
+                "/health",
+                headers={
+                    "Origin": "https://not-allowed.example",
+                    "Access-Control-Request-Method": "GET",
+                },
+            )
+            assert "access-control-allow-origin" not in denied.headers
+
+    asyncio.run(run())
+
+
+def test_packaged_main_mounts_audio_router_and_lifespan() -> None:
+    from pathlib import Path
+
+    main_path = Path(__file__).resolve().parents[1] / "app" / "main.py"
+    source = main_path.read_text(encoding="utf-8")
+
+    assert "include_audio_router(app, api_prefix=runtime_settings.api_prefix)" in source
+    assert "await start_audio_extension(app)" in source
+    assert "await close_audio_extension(app)" in source
+    assert '"/api/audio/metadata"' not in source  # route prefix stays configuration-driven

@@ -2,6 +2,18 @@
 
 This patch is additive. It does not replace supporter, visit, Supabase, webhook-security, replay-protection, or existing Telegram management code.
 
+## Production 404 fix
+
+The package now includes a drop-in `app/main.py` for the current supporter backend structure. The deployed application previously registered only the supporter and visit routers, so FastAPI returned 404 before any audio storage code could run.
+
+After copying the files, run:
+
+```bash
+python scripts/check_audio_routes.py
+```
+
+Do not deploy until it reports both `/api/audio/metadata` and `/api/audio/file`. Also confirm Render starts `uvicorn app.main:app`; changing a different module will not affect the live service.
+
 ## 1. Copy the extension
 
 Copy `app/audio_extension` into the existing backend so these modules are inside the existing `app` package.
@@ -80,16 +92,36 @@ Keep all current webhook security and replay protection unchanged.
 
 ## 4. CORS
 
-Keep the exact deployed frontend in `BACKEND_CORS_ORIGINS`. The React app needs public `GET` access only. Optionally add these exposed headers to the existing CORS middleware:
+The two deployed frontend origins are stored in `app/audio_extension/source_settings.py`:
 
 ```python
-expose_headers=[
-    "X-Supporters-Source",
-    "Warning",
-    "ETag",
-    "X-Audio-Version",
-]
+BACKEND_CORS_ORIGINS = (
+    "https://pay-coffee-topaz.vercel.app",
+    "https://j-s-ng-o-rgn-sz-lrgkldgs.vercel.app",
+)
 ```
+
+Do not add trailing slashes. Import the validated source-controlled list into the existing FastAPI CORS middleware:
+
+```python
+from app.audio_extension import get_backend_cors_origins
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=list(get_backend_cors_origins()),
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Accept", "Content-Type", "X-Telegram-Bot-Api-Secret-Token"],
+    expose_headers=[
+        "X-Supporters-Source",
+        "Warning",
+        "ETag",
+        "X-Audio-Version",
+    ],
+)
+```
+
+No `BACKEND_CORS_ORIGINS` Render environment variable is required. The React app needs public `GET` access only; `POST` remains available for the Telegram webhook.
 
 ## 5. Supabase Storage
 

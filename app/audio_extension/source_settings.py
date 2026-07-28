@@ -19,3 +19,10 @@ AUDIO_TELEGRAM_ALLOW_OWNER_PRIVATE_CHAT = True
 # Local storage is intended only for explicit development use. With
 # AUDIO_REQUIRE_PERSISTENT_STORAGE=True, production still requires Supabase.
 AUDIO_LOCAL_STORAGE_DIRECTORY = Path("data/website-audio")
+
+# Browser origins allowed to call the public supporter/audio API. CORS origin
+# matching is exact, so values are stored without trailing slashes.
+BACKEND_CORS_ORIGINS = (
+    "https://pay-coffee-topaz.vercel.app",
+    "https://j-s-ng-o-rgn-sz-lrgkldgs.vercel.app",
+)
