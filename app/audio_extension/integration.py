@@ -7,7 +7,7 @@ from fastapi import FastAPI
 
 from .config import AudioSettings
 from .router import router
-from .store import AudioStore
+from .store import AudioStore, AudioStoreError
 from .telegram import TelegramAudioController
 
 logger = logging.getLogger(__name__)
@@ -44,10 +44,31 @@ async def start_audio_extension(
     app.state.audio_owns_http_client = owns_client
     app.state.audio_store = store
     app.state.audio_telegram = controller
+    app.state.audio_storage_ready = False
+    app.state.audio_storage_error_code = ""
+    app.state.audio_storage_error = ""
 
     if settings.configuration_error:
-        logger.warning("Audio extension initialized with configuration warning: %s", settings.configuration_error)
+        app.state.audio_storage_error_code = "audio_not_configured"
+        app.state.audio_storage_error = settings.configuration_error
+        logger.warning(
+            "Audio extension initialized with configuration warning: %s",
+            settings.configuration_error,
+        )
+        return
+
+    try:
+        await store.initialize(force=True)
+    except AudioStoreError as exc:
+        app.state.audio_storage_error_code = exc.code
+        app.state.audio_storage_error = str(exc)
+        logger.error(
+            "Audio storage initialization failed code=%s message=%s",
+            exc.code,
+            exc,
+        )
     else:
+        app.state.audio_storage_ready = True
         logger.info(
             "Audio extension initialized mode=%s bucket=%s max_bytes=%s",
             store.mode,

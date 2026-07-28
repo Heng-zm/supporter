@@ -14,6 +14,7 @@ AUDIO_METADATA_CACHE_SECONDS = 5
 AUDIO_PENDING_TTL_SECONDS = 600
 AUDIO_HTTP_TIMEOUT_SECONDS = 60
 AUDIO_REQUIRE_PERSISTENT_STORAGE = True
+AUDIO_AUTO_CREATE_BUCKET = True  # Create website-audio when the server key permits it.
 AUDIO_TELEGRAM_ALLOW_OWNER_PRIVATE_CHAT = True
 
 # Local storage is intended only for explicit development use. With

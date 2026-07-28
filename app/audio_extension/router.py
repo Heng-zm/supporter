@@ -41,8 +41,11 @@ async def audio_metadata(request: Request, response: Response) -> dict[str, obje
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except AudioStoreError as exc:
         raise HTTPException(
-            status_code=502,
-            detail="The audio storage service is temporarily unavailable.",
+            status_code=503,
+            detail={
+                "message": "The audio storage service is temporarily unavailable.",
+                "code": exc.code,
+            },
         ) from exc
 
     if metadata is None:
@@ -76,8 +79,11 @@ async def audio_file(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except AudioStoreError as exc:
         raise HTTPException(
-            status_code=502,
-            detail="The audio storage service is temporarily unavailable.",
+            status_code=503,
+            detail={
+                "message": "The audio storage service is temporarily unavailable.",
+                "code": exc.code,
+            },
         ) from exc
 
     ascii_name = metadata.file_name.encode("ascii", "ignore").decode("ascii") or "audio"

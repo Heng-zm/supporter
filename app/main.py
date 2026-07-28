@@ -23,7 +23,7 @@ from app.services.visit_crypto import VisitCryptoService
 from app.services.visits import VisitService
 
 
-APP_VERSION = "1.1.1-audio"
+APP_VERSION = "1.1.3-audio"
 
 
 def _unique_origins(*origin_groups: list[str] | tuple[str, ...]) -> list[str]:
@@ -127,6 +127,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "audioRouteConfigured": True,
             "audioExtensionInitialized": audio_store is not None,
             "audioStorageMode": getattr(audio_store, "mode", None),
+            "audioStorageReady": getattr(audio_store, "storage_ready", False),
+            "audioStorageErrorCode": getattr(
+                audio_store,
+                "storage_error_code",
+                getattr(app.state, "audio_storage_error_code", ""),
+            ) or None,
+            "audioStorageError": getattr(
+                audio_store,
+                "storage_error_message",
+                getattr(app.state, "audio_storage_error", ""),
+            ) or None,
             "audioConfigurationError": getattr(
                 audio_settings,
                 "configuration_error",

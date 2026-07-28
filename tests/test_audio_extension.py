@@ -110,16 +110,25 @@ def test_supabase_storage_round_trip(tmp_path: Path) -> None:
         write_order: list[str] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            bucket_url = "https://project.supabase.co/storage/v1/bucket/website-audio"
+            if url == bucket_url and request.method == "GET":
+                return httpx.Response(200, json={"id": "website-audio"})
+
             prefix = "https://project.supabase.co/storage/v1/object/website-audio/"
-            assert str(request.url).startswith(prefix)
-            path = str(request.url)[len(prefix):]
+            assert url.startswith(prefix)
+            path = url[len(prefix):]
             if request.method == "POST":
                 objects[path] = request.content
                 write_order.append(path)
                 return httpx.Response(200, json={"path": path})
             if request.method == "GET":
                 if path not in objects:
-                    return httpx.Response(404, json={"message": "not found"})
+                    return httpx.Response(400, json={
+                        "statusCode": "404",
+                        "error": "not_found",
+                        "message": "Object not found",
+                    })
                 return httpx.Response(200, content=objects[path])
             return httpx.Response(405)
 
@@ -330,6 +339,117 @@ def test_settings_accept_service_role_alias(tmp_path: Path, monkeypatch) -> None
     assert cfg.configuration_error == ""
 
 
+def test_settings_accept_supabase_key_alias(monkeypatch) -> None:
+    monkeypatch.setenv("APP_ENVIRONMENT", "production")
+    monkeypatch.setenv("SUPABASE_URL", "https://project.supabase.co")
+    monkeypatch.delenv("SUPABASE_SECRET_KEY", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+    monkeypatch.setenv("SUPABASE_KEY", "existing-service-key")
+
+    cfg = AudioSettings.from_env()
+
+    assert cfg.supabase_secret_key == "existing-service-key"
+    assert cfg.resolved_storage_mode == "supabase"
+    assert cfg.configuration_error == ""
+
+
+def test_supabase_missing_manifest_http_400_is_available_false(tmp_path: Path) -> None:
+    async def run() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/storage/v1/bucket/website-audio"):
+                return httpx.Response(200, json={"id": "website-audio"})
+            if url.endswith("/storage/v1/object/website-audio/current.json"):
+                return httpx.Response(
+                    400,
+                    json={
+                        "statusCode": "404",
+                        "error": "not_found",
+                        "message": "Object not found",
+                    },
+                )
+            return httpx.Response(404)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            cfg = replace(
+                settings(tmp_path),
+                storage_mode="supabase",
+                supabase_url="https://project.supabase.co",
+                supabase_secret_key="service-key",
+            )
+            store = AudioStore(cfg, client)
+            assert await store.get_metadata() is None
+            assert store.storage_ready is True
+
+    asyncio.run(run())
+
+
+def test_supabase_bucket_is_created_automatically(tmp_path: Path) -> None:
+    async def run() -> None:
+        bucket_exists = False
+        create_payload: dict[str, object] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal bucket_exists, create_payload
+            url = str(request.url)
+            if url.endswith("/storage/v1/bucket/website-audio") and request.method == "GET":
+                if bucket_exists:
+                    return httpx.Response(200, json={"id": "website-audio"})
+                return httpx.Response(
+                    400,
+                    json={
+                        "statusCode": "404",
+                        "error": "not_found",
+                        "message": "Bucket not found",
+                    },
+                )
+            if url.endswith("/storage/v1/bucket") and request.method == "POST":
+                create_payload = __import__("json").loads(request.content)
+                bucket_exists = True
+                return httpx.Response(200, json={"name": "website-audio"})
+            return httpx.Response(404)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            cfg = replace(
+                settings(tmp_path),
+                storage_mode="supabase",
+                supabase_url="https://project.supabase.co",
+                supabase_secret_key="service-key",
+                auto_create_bucket=True,
+            )
+            store = AudioStore(cfg, client)
+            await store.initialize()
+            assert store.storage_ready is True
+            assert create_payload["id"] == "website-audio"
+            assert create_payload["public"] is False
+            assert create_payload["file_size_limit"] == 20_000_000
+
+    asyncio.run(run())
+
+
+def test_supabase_auth_error_has_safe_code(tmp_path: Path) -> None:
+    async def run() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(403, json={"message": "Invalid API key"})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            cfg = replace(
+                settings(tmp_path),
+                storage_mode="supabase",
+                supabase_url="https://project.supabase.co",
+                supabase_secret_key="wrong-key",
+            )
+            store = AudioStore(cfg, client)
+            try:
+                await store.get_metadata()
+            except Exception as exc:
+                assert getattr(exc, "code", "") == "supabase_auth_failed"
+            else:
+                raise AssertionError("Expected Supabase authentication failure")
+
+    asyncio.run(run())
+
+
 
 def test_audio_settings_are_stored_in_source(monkeypatch) -> None:
     # AUDIO_* environment entries must not alter the source-controlled values.
@@ -357,6 +477,7 @@ def test_audio_settings_are_stored_in_source(monkeypatch) -> None:
     assert cfg.pending_ttl_seconds == 600
     assert cfg.http_timeout_seconds == 60
     assert cfg.require_persistent_storage is True
+    assert cfg.auto_create_bucket is True
     assert cfg.telegram_allow_owner_private_chat is True
 
 

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 
 from .source_settings import (
+    AUDIO_AUTO_CREATE_BUCKET,
     AUDIO_ENABLED,
     AUDIO_HTTP_TIMEOUT_SECONDS,
     AUDIO_LOCAL_STORAGE_DIRECTORY,
@@ -83,6 +84,7 @@ class AudioSettings:
     telegram_allow_owner_private_chat: bool
     app_environment: str
     require_persistent_storage: bool
+    auto_create_bucket: bool = True
 
     @classmethod
     def from_env(cls) -> "AudioSettings":
@@ -102,10 +104,14 @@ class AudioSettings:
             metadata_cache_seconds=AUDIO_METADATA_CACHE_SECONDS,
             pending_ttl_seconds=AUDIO_PENDING_TTL_SECONDS,
             http_timeout_seconds=AUDIO_HTTP_TIMEOUT_SECONDS,
-            supabase_url=os.getenv("SUPABASE_URL", "").strip().rstrip("/"),
+            supabase_url=(
+                os.getenv("SUPABASE_URL", "").strip()
+                or os.getenv("SUPABASE_PROJECT_URL", "").strip()
+            ).rstrip("/"),
             supabase_secret_key=(
                 os.getenv("SUPABASE_SECRET_KEY", "").strip()
                 or os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+                or os.getenv("SUPABASE_KEY", "").strip()
             ),
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
@@ -117,6 +123,7 @@ class AudioSettings:
             ),
             app_environment=environment,
             require_persistent_storage=AUDIO_REQUIRE_PERSISTENT_STORAGE,
+            auto_create_bucket=AUDIO_AUTO_CREATE_BUCKET,
         )
 
     @property
