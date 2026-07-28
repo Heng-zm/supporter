@@ -11,8 +11,10 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 
 from app.audio_extension import (
     close_audio_extension,
+    configure_audio_telegram_webhook,
     get_backend_cors_origins,
     include_audio_router,
+    include_audio_telegram_webhook_router,
     start_audio_extension,
 )
 from app.config import Settings, get_settings
@@ -23,7 +25,7 @@ from app.services.visit_crypto import VisitCryptoService
 from app.services.visits import VisitService
 
 
-APP_VERSION = "1.1.3-audio"
+APP_VERSION = "1.1.4-audio"
 
 
 def _unique_origins(*origin_groups: list[str] | tuple[str, ...]) -> list[str]:
@@ -64,6 +66,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # Audio uploads/downloads use their own client because Telegram and
             # audio files need a longer timeout than normal supporter requests.
             await start_audio_extension(app)
+            await configure_audio_telegram_webhook(
+                app,
+                api_prefix=runtime_settings.api_prefix,
+            )
             yield
         finally:
             await close_audio_extension(app)
@@ -125,6 +131,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "telegramConfigured": runtime_settings.telegram_enabled,
             "visitEncryptionConfigured": app.state.visit_crypto.enabled,
             "audioRouteConfigured": True,
+            "audioTelegramWebhookRouteConfigured": True,
+            "audioTelegramWebhookConfigured": bool(
+                getattr(app.state, "audio_telegram_webhook_configured", False)
+            ),
+            "audioTelegramWebhookURL": getattr(
+                app.state, "audio_telegram_webhook_url", None
+            ),
+            "audioTelegramWebhookError": getattr(
+                app.state, "audio_telegram_webhook_error", ""
+            ) or None,
             "audioExtensionInitialized": audio_store is not None,
             "audioStorageMode": getattr(audio_store, "mode", None),
             "audioStorageReady": getattr(audio_store, "storage_ready", False),
@@ -163,6 +179,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "service": runtime_settings.app_name,
             "health": "/health",
             "audioMetadata": f"{runtime_settings.api_prefix}/audio/metadata",
+            "telegramWebhook": f"{runtime_settings.api_prefix}/telegram/webhook",
             "docs": "/docs",
         }
 
@@ -182,6 +199,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # This call was missing from the deployed backend. Without it FastAPI
     # correctly returns 404 for /api/audio/metadata.
     include_audio_router(app, api_prefix=runtime_settings.api_prefix)
+    include_audio_telegram_webhook_router(
+        app,
+        api_prefix=runtime_settings.api_prefix,
+    )
 
     return app
 

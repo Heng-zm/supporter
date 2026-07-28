@@ -10,6 +10,7 @@ if str(PROJECT_ROOT) not in sys.path:
 EXPECTED_ROUTES = {
     "/api/audio/metadata",
     "/api/audio/file",
+    "/api/telegram/webhook",
 }
 
 
@@ -31,7 +32,9 @@ def _patch_source_check() -> tuple[bool, list[str]]:
     source = main_path.read_text(encoding="utf-8")
     required = [
         "include_audio_router(app, api_prefix=runtime_settings.api_prefix)",
+        "include_audio_telegram_webhook_router(",
         "await start_audio_extension(app)",
+        "await configure_audio_telegram_webhook(",
         "await close_audio_extension(app)",
     ]
     missing = [value for value in required if value not in source]

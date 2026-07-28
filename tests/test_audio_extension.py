@@ -553,3 +553,212 @@ def test_packaged_main_mounts_audio_router_and_lifespan() -> None:
     assert "await start_audio_extension(app)" in source
     assert "await close_audio_extension(app)" in source
     assert '"/api/audio/metadata"' not in source  # route prefix stays configuration-driven
+
+
+def test_audio_webhook_rejects_invalid_secret(tmp_path: Path) -> None:
+    from fastapi import FastAPI
+
+    from app.audio_extension.webhook import (
+        AudioTelegramWebhookSettings,
+        include_audio_telegram_webhook_router,
+    )
+
+    async def run() -> None:
+        app = FastAPI()
+        app.state.audio_api_prefix = "/api"
+        app.state.audio_telegram_webhook_settings = AudioTelegramWebhookSettings(
+            bot_token="token",
+            secret_token="correct_secret",
+            webhook_url="https://example.com/api/telegram/webhook",
+            auto_configure=True,
+            drop_pending_updates=False,
+            max_connections=10,
+        )
+        include_audio_telegram_webhook_router(app, api_prefix="/api")
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                "/api/telegram/webhook",
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Telegram-Bot-Api-Secret-Token": "wrong_secret",
+                },
+                json={"update_id": 1, "message": {}},
+            )
+            assert response.status_code == 403
+
+    asyncio.run(run())
+
+
+def test_audio_webhook_dispatches_audio_status(tmp_path: Path) -> None:
+    from fastapi import FastAPI
+
+    from app.audio_extension.webhook import (
+        AudioTelegramWebhookSettings,
+        include_audio_telegram_webhook_router,
+    )
+
+    async def run() -> None:
+        sent_messages: list[dict[str, object]] = []
+
+        def telegram_handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/sendMessage"):
+                sent_messages.append(__import__("json").loads(request.content))
+                return httpx.Response(
+                    200,
+                    json={"ok": True, "result": {"message_id": 1}},
+                )
+            return httpx.Response(404)
+
+        telegram_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(telegram_handler)
+        )
+        try:
+            cfg = settings(tmp_path)
+            store = AudioStore(cfg, telegram_client)
+            controller = TelegramAudioController(cfg, telegram_client, store)
+
+            app = FastAPI()
+            app.state.audio_api_prefix = "/api"
+            app.state.audio_telegram = controller
+            app.state.audio_telegram_webhook_settings = AudioTelegramWebhookSettings(
+                bot_token="token",
+                secret_token="correct_secret",
+                webhook_url="https://example.com/api/telegram/webhook",
+                auto_configure=True,
+                drop_pending_updates=False,
+                max_connections=10,
+            )
+            include_audio_telegram_webhook_router(app, api_prefix="/api")
+
+            update = {
+                "update_id": 101,
+                "message": {
+                    "message_id": 5,
+                    "text": "/audio status",
+                    "chat": {"id": 100, "type": "group"},
+                    "from": {"id": 200, "is_bot": False},
+                },
+            }
+
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://test",
+            ) as client:
+                response = await client.post(
+                    "/api/telegram/webhook",
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Telegram-Bot-Api-Secret-Token": "correct_secret",
+                    },
+                    json=update,
+                )
+                assert response.status_code == 200
+                assert response.json() == {"ok": True, "handled": True}
+
+                duplicate = await client.post(
+                    "/api/telegram/webhook",
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Telegram-Bot-Api-Secret-Token": "correct_secret",
+                    },
+                    json=update,
+                )
+                assert duplicate.status_code == 200
+                assert duplicate.json()["duplicate"] is True
+
+            assert len(sent_messages) == 1
+            assert sent_messages[0]["chat_id"] == "100"
+            assert "No Telegram-managed website audio" in str(
+                sent_messages[0]["text"]
+            )
+        finally:
+            await telegram_client.aclose()
+
+    asyncio.run(run())
+
+
+def test_configure_audio_telegram_webhook_and_verify(monkeypatch) -> None:
+    from fastapi import FastAPI
+
+    from app.audio_extension.webhook import configure_audio_telegram_webhook
+
+    async def run() -> None:
+        calls: list[tuple[str, dict[str, object]]] = []
+        expected_url = "https://supporter-ipio.onrender.com/api/telegram/webhook"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            payload = __import__("json").loads(request.content or b"{}")
+            calls.append((str(request.url), payload))
+            if str(request.url).endswith("/setWebhook"):
+                return httpx.Response(200, json={"ok": True, "result": True})
+            if str(request.url).endswith("/getWebhookInfo"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "result": {
+                            "url": expected_url,
+                            "pending_update_count": 0,
+                        },
+                    },
+                )
+            return httpx.Response(404)
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            app = FastAPI()
+            app.state.audio_http_client = client
+            configured = await configure_audio_telegram_webhook(
+                app,
+                api_prefix="/api",
+            )
+            assert configured is True
+            assert app.state.audio_telegram_webhook_configured is True
+            assert app.state.audio_telegram_webhook_error == ""
+            assert len(calls) == 2
+            set_payload = calls[0][1]
+            assert set_payload["url"] == expected_url
+            assert set_payload["secret_token"] == "safe_secret_123"
+            assert set_payload["allowed_updates"] == ["message"]
+            assert set_payload["drop_pending_updates"] is False
+            assert set_payload["max_connections"] == 10
+        finally:
+            await client.aclose()
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:test-token")
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "safe_secret_123")
+    monkeypatch.setenv(
+        "TELEGRAM_WEBHOOK_URL",
+        "https://supporter-ipio.onrender.com/api/telegram/webhook",
+    )
+    monkeypatch.setenv("TELEGRAM_AUTO_CONFIGURE_WEBHOOK", "true")
+    asyncio.run(run())
+
+
+def test_webhook_settings_derive_render_url(monkeypatch) -> None:
+    from app.audio_extension.webhook import AudioTelegramWebhookSettings
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:test-token")
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "safe_secret")
+    monkeypatch.delenv("TELEGRAM_WEBHOOK_URL", raising=False)
+    monkeypatch.setenv("RENDER_EXTERNAL_URL", "https://supporter-ipio.onrender.com/")
+
+    cfg = AudioTelegramWebhookSettings.from_env(api_prefix="/api")
+
+    assert cfg.webhook_url == (
+        "https://supporter-ipio.onrender.com/api/telegram/webhook"
+    )
+    assert cfg.configuration_error == ""
+
+
+def test_packaged_main_mounts_telegram_webhook() -> None:
+    main_path = Path(__file__).resolve().parents[1] / "app" / "main.py"
+    source = main_path.read_text(encoding="utf-8")
+
+    assert "include_audio_telegram_webhook_router(" in source
+    assert "await configure_audio_telegram_webhook(" in source
+    assert '"audioTelegramWebhookConfigured"' in source
