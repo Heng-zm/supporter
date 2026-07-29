@@ -1,5 +1,9 @@
--- Run once in Supabase SQL Editor.
--- The bucket remains private. Only the backend service-role key reads/writes it.
+-- Run once in Supabase SQL Editor, and rerun after upgrading from an older
+-- unencrypted audio extension. The bucket remains private. Only the trusted
+-- backend secret/service-role key reads or writes it.
+--
+-- 20,065,936 bytes covers a 20,000,000-byte plaintext file plus the bounded
+-- AES-256-GCM chunk container overhead configured in source_settings.py.
 
 insert into storage.buckets (
     id,
@@ -12,16 +16,17 @@ values (
     'website-audio',
     'website-audio',
     false,
-    20000000,
+    20065936,
     array[
+        'application/octet-stream',
+        'application/json',
         'audio/mpeg',
         'audio/wav',
         'audio/ogg',
         'audio/mp4',
         'audio/aac',
         'audio/webm',
-        'audio/flac',
-        'application/json'
+        'audio/flac'
     ]::text[]
 )
 on conflict (id) do update set

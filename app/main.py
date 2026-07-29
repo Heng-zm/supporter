@@ -18,6 +18,7 @@ from app.audio_extension import (
     start_audio_extension,
 )
 from app.config import Settings, get_settings
+from app.middleware.body_limit import RequestBodyLimitMiddleware
 from app.routers import supporters, visits
 from app.services.supabase import SupabaseService
 from app.services.telegram import TelegramService
@@ -118,6 +119,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             TrustedHostMiddleware,
             allowed_hosts=runtime_settings.allowed_hosts,
         )
+
+    app.add_middleware(
+        RequestBodyLimitMiddleware,
+        max_bytes=runtime_settings.max_request_body_bytes,
+    )
 
     started_at = time.monotonic()
 
