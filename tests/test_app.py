@@ -155,6 +155,93 @@ def test_packaged_webhook_dispatches_supporter_commands() -> None:
     assert handled_updates == [501]
 
 
+def test_packaged_add_command_creates_supporter() -> None:
+    settings = Settings(
+        app_environment="test",
+        require_encrypted_visits=False,
+        trust_proxy_headers=False,
+        supabase_url="https://test.supabase.co",
+        supabase_secret_key="server-secret",
+        telegram_bot_token="test-bot-token",
+        telegram_chat_id="123",
+        telegram_commands_enabled=True,
+        telegram_webhook_secret="telegram-webhook-secret-123456",
+    )
+    app = create_app(settings)
+    created_rows: list[tuple[dict[str, object], int]] = []
+    replies: list[str] = []
+
+    class RecordingSupabase:
+        enabled = True
+
+        async def create_supporter_from_telegram(
+            self,
+            row: dict[str, object],
+            update_id: int,
+        ) -> dict[str, object]:
+            created_rows.append((row, update_id))
+            return {
+                "id": "supporter-telegram-1",
+                **row,
+            }
+
+    class RecordingTelegram:
+        async def send_message(
+            self,
+            _chat_id,
+            text: str,
+            **_kwargs,
+        ) -> object:
+            replies.append(text)
+            return object()
+
+    with TestClient(app) as client:
+        app.state.telegram_commands = TelegramCommandService(
+            settings,
+            RecordingSupabase(),  # type: ignore[arg-type]
+            RecordingTelegram(),  # type: ignore[arg-type]
+        )
+        response = client.post(
+            "/api/telegram/webhook",
+            headers={
+                "Content-Type": "application/json",
+                "X-Telegram-Bot-Api-Secret-Token": (
+                    "telegram-webhook-secret-123456"
+                ),
+            },
+            json={
+                "update_id": 601,
+                "message": {
+                    "message_id": 20,
+                    "from": {
+                        "id": 123,
+                        "is_bot": False,
+                        "first_name": "Admin",
+                    },
+                    "chat": {"id": 123, "type": "private"},
+                    "text": "/add@OzoDonationBot Alice | 12.50 | USD | Thanks",
+                },
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "handled": True}
+    assert created_rows == [
+        (
+            {
+                "name": "Alice",
+                "amount": 12.5,
+                "currency": "USD",
+                "message": "Thanks",
+                "avatar_url": None,
+                "payment_method": None,
+            },
+            601,
+        )
+    ]
+    assert "Supporter added" in replies[0]
+
+
 async def test_body_limit_rejects_chunked_payload_without_content_length() -> None:
     from app.middleware.body_limit import RequestBodyLimitMiddleware
 

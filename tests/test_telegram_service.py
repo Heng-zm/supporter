@@ -81,6 +81,34 @@ async def test_webhook_configuration_enables_callback_queries() -> None:
     assert payloads[0]["allowed_updates"] == ["message", "callback_query"]
 
 
+async def test_command_configuration_registers_supporter_aliases() -> None:
+    payloads: list[dict[str, object]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        payloads.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"ok": True, "result": True})
+
+    settings = Settings(
+        telegram_bot_token="token",
+        require_encrypted_visits=False,
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        service = TelegramService(settings, client)
+        result = await service.configure_commands()
+
+    commands = payloads[0]["commands"]
+    assert isinstance(commands, list)
+    command_names = {
+        str(command["command"])
+        for command in commands
+        if isinstance(command, dict)
+    }
+    assert {"add", "command", "commands", "manage"} <= command_names
+    assert result.ok is True
+
+
 async def test_send_message_includes_inline_keyboard() -> None:
     payloads: list[dict[str, object]] = []
 

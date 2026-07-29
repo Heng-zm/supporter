@@ -315,6 +315,8 @@ class TelegramService:
             {
                 "commands": [
                     {"command": "manage", "description": "Open supporter manager"},
+                    {"command": "command", "description": "Open supporter manager"},
+                    {"command": "commands", "description": "Show supporter commands"},
                     {"command": "list", "description": "List supporters"},
                     {"command": "add", "description": "Add a new supporter"},
                     {"command": "cancel", "description": "Cancel current action"},

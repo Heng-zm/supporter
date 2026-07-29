@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -33,7 +34,8 @@ from app.services.telegram_commands import TelegramCommandService
 from app.services.visit_crypto import VisitCryptoService
 from app.services.visits import VisitService
 
-APP_VERSION = "2.4.1-audio"
+APP_VERSION = "2.4.2-audio"
+logger = logging.getLogger("app.startup")
 
 OPENAPI_TAGS = [
     {
@@ -126,6 +128,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.telegram_commands_configuration_error = (
                     commands_result.error or ""
                 )
+                if not commands_result.ok:
+                    logger.warning(
+                        "Telegram command menu configuration failed: %s",
+                        commands_result.error or "unknown error",
+                    )
             yield
         finally:
             await close_audio_extension(app)
@@ -257,6 +264,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             payload["environment"] = runtime_settings.app_environment
             payload["supabaseConfigured"] = runtime_settings.supabase_enabled
             payload["telegramConfigured"] = runtime_settings.telegram_enabled
+            payload["telegramBotConfigured"] = (
+                runtime_settings.telegram_bot_enabled
+            )
+            payload["telegramCommandsEnabled"] = (
+                runtime_settings.telegram_commands_enabled
+            )
+            payload["telegramCommandsConfigured"] = (
+                runtime_settings.telegram_commands_configured
+            )
+            payload["telegramWebhookAutoConfigureEnabled"] = (
+                runtime_settings.telegram_auto_configure_webhook
+            )
+            payload["telegramCommandMenuConfigured"] = getattr(
+                app.state,
+                "telegram_commands_configured",
+                None,
+            )
+            payload["telegramCommandMenuConfigurationError"] = getattr(
+                app.state,
+                "telegram_commands_configuration_error",
+                None,
+            )
             payload["visitEncryptionConfigured"] = app.state.visit_crypto.enabled
             payload["audioTelegramWebhookURL"] = getattr(
                 app.state, "audio_telegram_webhook_url", None

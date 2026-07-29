@@ -363,6 +363,35 @@ async def test_manage_command_shows_add_and_list_buttons() -> None:
     assert {button["callback_data"] for button in buttons} == {"sp:add", "sp:list:0"}
 
 
+@pytest.mark.parametrize("command", ["/command", "/commands"])
+async def test_command_alias_shows_supporter_manager(command: str) -> None:
+    from app.models import TelegramUpdate
+    from app.services.telegram_commands import TelegramCommandService
+
+    telegram = FakeCommandTelegram()
+    service = TelegramCommandService(
+        _manager_settings(),
+        FakeManagerSupabase(),
+        telegram,  # type: ignore[arg-type]
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 2010,
+            "message": {
+                "message_id": 11,
+                "from": {"id": 123, "is_bot": False, "first_name": "Admin"},
+                "chat": {"id": 123, "type": "private"},
+                "text": command,
+            },
+        }
+    )
+
+    await service.handle(update)
+
+    assert "Supporter manager" in telegram.messages[0][1]
+    assert telegram.markups[0] is not None
+
+
 async def test_list_callback_displays_update_and_delete_buttons() -> None:
     from app.services.telegram_commands import TelegramCommandService
 

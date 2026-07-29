@@ -3,19 +3,19 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
-from pathlib import Path
+import sys
 import tempfile
 import wave
-import sys
+from pathlib import Path
+
+import httpx
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import httpx
-
-from app.audio_extension.config import AudioSettings
-from app.audio_extension.store import AudioStore
+from app.audio_extension.config import AudioSettings  # noqa: E402
+from app.audio_extension.store import AudioStore  # noqa: E402
 
 
 def sample_wav(marker: bytes = b"\x00\x00") -> bytes:

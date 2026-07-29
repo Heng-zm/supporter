@@ -79,7 +79,7 @@ def test_telegram_schema_error_is_actionable() -> None:
             code="42P10",
         )
     )
-    assert "supabase_migration_v1_3_2.sql" in message
+    assert "supabase/supabase_migration_v1_3_2.sql" in message
     assert "42P10" in message
 
 

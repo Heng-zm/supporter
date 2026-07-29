@@ -1,4 +1,4 @@
-# Ozo Donation API v2.4.1-audio — high-security server
+# Ozo Donation API v2.4.2-audio — high-security server
 
 FastAPI backend for the public supporter list, encrypted visit notifications,
 and the Telegram step-by-step supporter manager.
@@ -27,6 +27,10 @@ Version 2.4.0 adds structured website-visit analytics. Run
 `supabase/supabase_migration_v2_4_0_visit_analytics.sql` in the Supabase SQL
 Editor before deploying this release.
 
+Version 2.4.2 restores the `/command` and `/commands` supporter-manager aliases,
+improves Telegram replay/action cache performance, and adds deployment checks
+for the webhook update types and registered bot commands.
+
 ## Deploy safely
 
 Copy `.env.example` into Render environment variables and replace every placeholder.
@@ -43,6 +47,8 @@ SUPABASE_URL=https://YOUR_PROJECT.supabase.co
 SUPABASE_SECRET_KEY=YOUR_SERVICE_ROLE_OR_SERVER_SECRET
 
 TELEGRAM_COMMANDS_ENABLED=true
+TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN
+TELEGRAM_CHAT_ID=YOUR_NUMERIC_CHAT_ID
 TELEGRAM_ADMIN_USER_IDS=YOUR_NUMERIC_TELEGRAM_USER_ID
 TELEGRAM_WEBHOOK_SECRET=YOUR_UNIQUE_SECRET
 TELEGRAM_WEBHOOK_URL=https://your-backend.example.com/api/telegram/webhook
@@ -209,11 +215,20 @@ a secret token, and a lower connection limit. Telegram management commands:
 
 ```text
 /manage
+/command
+/commands
 /list
 /add
 /cancel
 /help
 ```
+
+Both `/command` and `/commands` open the supporter manager. Commands only run
+when `TELEGRAM_COMMANDS_ENABLED=true`, the message chat matches
+`TELEGRAM_CHAT_ID`, and the sender is listed in `TELEGRAM_ADMIN_USER_IDS`.
+Existing Supabase deployments must also run
+`supabase/supabase_migration_v1_3_2.sql` so repeated Telegram deliveries can be
+handled idempotently.
 
 Do not add a Telegram source-IP allowlist unless you maintain accurate network
 ranges. The secret header and rate limiter remain active when that setting is empty.
@@ -239,6 +254,8 @@ python -m app.run
 ```bash
 python -m compileall -q app tests
 pytest -q
+python scripts/security_check.py
+python scripts/check_telegram_webhook.py
 ```
 
 Application-level rate limiting is process-local. Keep `WEB_CONCURRENCY=1` on a

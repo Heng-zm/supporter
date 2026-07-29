@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from html import escape
@@ -44,7 +45,8 @@ MANAGER_HELP = (
     "Add and update supporters one question at a time.\n"
     "បញ្ចូល និងកែប្រែព័ត៌មាន "
     "មួយជំហានម្តង។\n\n"
-    "Commands: <code>/manage</code>, <code>/list</code>, <code>/add</code>, "
+    "Commands: <code>/manage</code>, <code>/command</code>, "
+    "<code>/commands</code>, <code>/list</code>, <code>/add</code>, "
     "<code>/back</code>, <code>/skip</code>, <code>/cancel</code>"
 )
 
@@ -78,23 +80,25 @@ class ProcessedUpdateCache:
     def __init__(self, ttl_seconds: int = 86400, max_items: int = 10000) -> None:
         self.ttl_seconds = ttl_seconds
         self.max_items = max_items
-        self._items: dict[int, float] = {}
+        self._items: OrderedDict[int, float] = OrderedDict()
         self._lock = asyncio.Lock()
 
     async def reserve(self, update_id: int) -> bool:
         now = time.monotonic()
         async with self._lock:
-            if len(self._items) >= self.max_items:
-                self._items = {
-                    key: expires_at
-                    for key, expires_at in self._items.items()
-                    if expires_at > now
-                }
-                if len(self._items) >= self.max_items:
-                    oldest = min(self._items, key=self._items.get)
-                    self._items.pop(oldest, None)
-            if self._items.get(update_id, 0) > now:
+            while self._items:
+                _, expires_at = next(iter(self._items.items()))
+                if expires_at > now:
+                    break
+                self._items.popitem(last=False)
+
+            current_expiry = self._items.get(update_id, 0)
+            if current_expiry > now:
                 return False
+
+            self._items.pop(update_id, None)
+            while len(self._items) >= self.max_items:
+                self._items.popitem(last=False)
             self._items[update_id] = now + self.ttl_seconds
             return True
 
@@ -111,17 +115,21 @@ class PendingActionCache:
     ) -> None:
         self.ttl_seconds = ttl_seconds
         self.max_items = max_items
-        self._items: dict[tuple[int, int], tuple[PendingAction, float]] = {}
+        self._items: OrderedDict[
+            tuple[int, int],
+            tuple[PendingAction, float],
+        ] = OrderedDict()
         self._lock = asyncio.Lock()
 
     async def set(self, chat_id: int, user_id: int, action: PendingAction) -> None:
         now = time.monotonic()
         async with self._lock:
             self._remove_expired(now)
-            if len(self._items) >= self.max_items:
-                oldest = min(self._items, key=lambda key: self._items[key][1])
-                self._items.pop(oldest, None)
-            self._items[(chat_id, user_id)] = (action, now + self.ttl_seconds)
+            key = (chat_id, user_id)
+            self._items.pop(key, None)
+            while len(self._items) >= self.max_items:
+                self._items.popitem(last=False)
+            self._items[key] = (action, now + self.ttl_seconds)
 
     async def get(self, chat_id: int, user_id: int) -> PendingAction | None:
         now = time.monotonic()
@@ -140,9 +148,11 @@ class PendingActionCache:
             self._items.pop((chat_id, user_id), None)
 
     def _remove_expired(self, now: float) -> None:
-        expired = [key for key, (_, expires_at) in self._items.items() if expires_at <= now]
-        for key in expired:
-            self._items.pop(key, None)
+        while self._items:
+            _, (_, expires_at) = next(iter(self._items.items()))
+            if expires_at > now:
+                break
+            self._items.popitem(last=False)
 
 
 def _parse_amount(value: str) -> Decimal:
@@ -276,8 +286,8 @@ def _database_error_message(exc: SupabaseError) -> str:
     if code == "42P10":
         return (
             "❌ <b>Supabase schema update required</b>\n"
-            "Run <code>supabase_migration_v1_3_2.sql</code> in the Supabase "
-            "SQL Editor, then send the command again.\n"
+            "Run <code>supabase/supabase_migration_v1_3_2.sql</code> in the "
+            "Supabase SQL Editor, then send the command again.\n"
             "Error code: <code>42P10</code>"
         )
     if code == "42703":
@@ -429,6 +439,8 @@ class TelegramCommandService:
             "/help",
             "/start",
             "/manage",
+            "/command",
+            "/commands",
             "/list",
             "/supporters",
             "/cancel",
@@ -460,6 +472,10 @@ class TelegramCommandService:
         pending: PendingAction | None,
     ) -> None:
         if str(message.chat.id) != self.settings.telegram_chat_id.strip():
+            logger.warning(
+                "Telegram command ignored: update_id=%s reason=chat_mismatch",
+                update.update_id,
+            )
             return
         if not self._authorized(message):
             await self._reply(message, "⛔ You are not authorized to use this command.")
@@ -479,7 +495,7 @@ class TelegramCommandService:
             )
             return
 
-        if command in {"/help", "/start", "/manage"}:
+        if command in {"/help", "/start", "/manage", "/command", "/commands"}:
             await self.pending_actions.clear(message.chat.id, sender.id)
             await self._send_menu(message)
             return
