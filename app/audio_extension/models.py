@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
-import re
 from typing import Any
 
 _VERSION_RE = re.compile(r"^[A-Za-z0-9._-]{1,160}$")
@@ -76,7 +76,7 @@ class AudioMetadata:
         }
 
     @classmethod
-    def from_manifest(cls, value: dict[str, Any]) -> "AudioMetadata":
+    def from_manifest(cls, value: dict[str, Any]) -> AudioMetadata:
         version = str(value.get("version") or "").strip()
         file_name = str(value.get("fileName") or "").strip()
         mime_type = str(value.get("mimeType") or "").strip().lower()
@@ -212,7 +212,7 @@ class AudioHistory:
         }
 
     @classmethod
-    def from_manifest(cls, value: dict[str, Any], *, limit: int) -> "AudioHistory":
+    def from_manifest(cls, value: dict[str, Any], *, limit: int) -> AudioHistory:
         if value.get("formatVersion") != 1:
             raise ValueError("Audio history formatVersion is invalid.")
         raw_items = value.get("items")

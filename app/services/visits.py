@@ -240,11 +240,11 @@ class VisitService:
 
         analytics: dict[str, Any] = {}
         if self.settings.visit_detailed_analytics_enabled:
-            payload_campaign = {
-                key: _clean_field(str(value), 160)
-                for key, value in payload.campaign.model_dump(exclude_none=True).items()
-                if _clean_field(str(value), 160)
-            }
+            payload_campaign: dict[str, str] = {}
+            for key, value in payload.campaign.model_dump(exclude_none=True).items():
+                cleaned = _clean_field(str(value), 160)
+                if cleaned:
+                    payload_campaign[key] = cleaned
             campaign = {
                 **payload_campaign,
                 **_campaign_from_url(payload.url),

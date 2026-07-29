@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 import hmac
 import json
 import logging
 import os
 import re
 import time
-from typing import Any
+from collections import OrderedDict
+from dataclasses import dataclass
 
 import httpx
 from fastapi import APIRouter, FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
+
+from app.config import Settings
+from app.models import TelegramUpdate
+from app.utils.network import client_ip
+from app.utils.security import ip_is_trusted, sha256_text
 
 from .integration import handle_audio_telegram_update
 
@@ -36,7 +42,7 @@ class AudioTelegramWebhookSettings:
     max_connections: int
 
     @classmethod
-    def from_env(cls, *, api_prefix: str = "/api") -> "AudioTelegramWebhookSettings":
+    def from_env(cls, *, api_prefix: str = "/api") -> AudioTelegramWebhookSettings:
         explicit_url = os.getenv("TELEGRAM_WEBHOOK_URL", "").strip()
         render_url = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
         normalized_prefix = "/" + api_prefix.strip("/") if api_prefix.strip("/") else ""
@@ -51,7 +57,7 @@ class AudioTelegramWebhookSettings:
                 or os.getenv("TELEGRAM_WEBHOOK_SECRET_TOKEN", "").strip()
             ),
             webhook_url=webhook_url.rstrip("/"),
-            auto_configure=_env_bool("TELEGRAM_AUTO_CONFIGURE_WEBHOOK", True),
+            auto_configure=_env_bool("TELEGRAM_AUTO_CONFIGURE_WEBHOOK", False),
             drop_pending_updates=_env_bool(
                 "TELEGRAM_WEBHOOK_DROP_PENDING_UPDATES",
                 False,
@@ -65,7 +71,7 @@ class AudioTelegramWebhookSettings:
         )
 
     @property
-    def configuration_error(self) -> str:
+    def receiver_configuration_error(self) -> str:
         if not self.bot_token:
             return "TELEGRAM_BOT_TOKEN is not configured."
         if not self.secret_token:
@@ -75,6 +81,13 @@ class AudioTelegramWebhookSettings:
                 "TELEGRAM_WEBHOOK_SECRET must contain only letters, numbers, "
                 "underscore, or hyphen and be 1-256 characters long."
             )
+        return ""
+
+    @property
+    def configuration_error(self) -> str:
+        receiver_error = self.receiver_configuration_error
+        if receiver_error:
+            return receiver_error
         if not self.webhook_url:
             return (
                 "TELEGRAM_WEBHOOK_URL or RENDER_EXTERNAL_URL is not configured."
@@ -134,28 +147,29 @@ async def _claim_update(app: FastAPI, update_id: int | None) -> str:
         app.state.audio_telegram_replay_lock = lock
 
     cache = getattr(app.state, "audio_telegram_replay_cache", None)
-    if not isinstance(cache, dict):
-        cache = {}
+    if isinstance(cache, dict) and not isinstance(cache, OrderedDict):
+        cache = OrderedDict(cache.items())
+        app.state.audio_telegram_replay_cache = cache
+    elif not isinstance(cache, OrderedDict):
+        cache = OrderedDict()
         app.state.audio_telegram_replay_cache = cache
 
     now = time.monotonic()
     async with lock:
-        expired = [
-            key
-            for key, (_state, timestamp) in cache.items()
-            if now - float(timestamp) >= _REPLAY_TTL_SECONDS
-        ]
-        for key in expired:
-            cache.pop(key, None)
+        while cache:
+            oldest_key = next(iter(cache))
+            _state, timestamp = cache[oldest_key]
+            if now - float(timestamp) < _REPLAY_TTL_SECONDS:
+                break
+            cache.popitem(last=False)
 
         current = cache.get(update_id)
         if current is not None:
             return str(current[0])
 
         if len(cache) >= _REPLAY_MAX_ITEMS:
-            oldest = sorted(cache.items(), key=lambda item: item[1][1])[:1000]
-            for key, _ in oldest:
-                cache.pop(key, None)
+            for _ in range(min(1000, len(cache))):
+                cache.popitem(last=False)
 
         cache[update_id] = ("processing", now)
         return "claimed"
@@ -166,10 +180,11 @@ async def _complete_update(app: FastAPI, update_id: int | None) -> None:
         return
     lock = getattr(app.state, "audio_telegram_replay_lock", None)
     cache = getattr(app.state, "audio_telegram_replay_cache", None)
-    if not isinstance(lock, asyncio.Lock) or not isinstance(cache, dict):
+    if not isinstance(lock, asyncio.Lock) or not isinstance(cache, OrderedDict):
         return
     async with lock:
         cache[update_id] = ("completed", time.monotonic())
+        cache.move_to_end(update_id)
 
 
 async def _release_update(app: FastAPI, update_id: int | None) -> None:
@@ -185,22 +200,65 @@ async def _release_update(app: FastAPI, update_id: int | None) -> None:
 
 @router.post("/webhook", include_in_schema=False)
 async def audio_telegram_webhook(request: Request) -> JSONResponse:
-    settings = _settings(request)
-    if settings.configuration_error:
+    audio_settings = _settings(request)
+    runtime_settings = getattr(request.app.state, "settings", None)
+    commands_enabled = bool(
+        isinstance(runtime_settings, Settings)
+        and runtime_settings.telegram_commands_enabled
+    )
+
+    if audio_settings.receiver_configuration_error and not commands_enabled:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Telegram webhook is not configured.",
         )
 
+    expected_secret = (
+        runtime_settings.telegram_webhook_secret
+        if commands_enabled
+        else audio_settings.secret_token
+    )
     received_secret = request.headers.get(
         "X-Telegram-Bot-Api-Secret-Token",
         "",
     ).strip()
-    if not hmac.compare_digest(settings.secret_token, received_secret):
+    if not hmac.compare_digest(expected_secret, received_secret):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid Telegram webhook secret.",
         )
+
+    if isinstance(runtime_settings, Settings):
+        resolved_ip = client_ip(request, runtime_settings)
+        allowed_networks = runtime_settings.telegram_webhook_allowed_networks
+        if allowed_networks and not ip_is_trusted(resolved_ip, allowed_networks):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Not found.",
+            )
+
+        rate_limiter = getattr(
+            request.app.state,
+            "telegram_webhook_rate_limiter",
+            None,
+        )
+        if rate_limiter is not None:
+            rate_key = sha256_text(
+                f"{runtime_settings.visit_hash_salt}:telegram-webhook:{resolved_ip}"
+            )
+            retry_after = await rate_limiter.check(
+                rate_key,
+                runtime_settings.telegram_webhook_rate_limit_per_minute,
+            )
+            if retry_after is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Too many webhook requests.",
+                    headers={
+                        "Retry-After": str(retry_after),
+                        "Cache-Control": "no-store",
+                    },
+                )
 
     content_type = request.headers.get("content-type", "").lower()
     if "application/json" not in content_type:
@@ -217,11 +275,11 @@ async def audio_telegram_webhook(request: Request) -> JSONResponse:
                     status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                     detail="Telegram update is too large.",
                 )
-        except ValueError:
+        except ValueError as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid Content-Length header.",
-            )
+            ) from exc
 
     raw = await request.body()
     if len(raw) > _MAX_UPDATE_BYTES:
@@ -261,6 +319,20 @@ async def audio_telegram_webhook(request: Request) -> JSONResponse:
 
     try:
         handled = await handle_audio_telegram_update(request.app, update)
+        if not handled and commands_enabled:
+            try:
+                command_update = TelegramUpdate.model_validate(update)
+            except ValidationError:
+                command_update = None
+
+            if command_update is not None:
+                commands = getattr(request.app.state, "telegram_commands", None)
+                if commands is None:
+                    raise RuntimeError(
+                        "Telegram command service is not initialized."
+                    )
+                await commands.handle(command_update)
+                handled = True
     except Exception:
         await _release_update(request.app, update_id)
         logger.exception("Telegram /audio update processing failed update_id=%s", update_id)
@@ -316,6 +388,12 @@ async def configure_audio_telegram_webhook(
         "drop_pending_updates": settings.drop_pending_updates,
         "max_connections": settings.max_connections,
     }
+    runtime_settings = getattr(app.state, "settings", None)
+    if (
+        isinstance(runtime_settings, Settings)
+        and runtime_settings.telegram_commands_enabled
+    ):
+        payload["allowed_updates"].append("callback_query")
 
     try:
         response = await client.post(set_url, json=payload)

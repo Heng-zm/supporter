@@ -29,10 +29,11 @@ from app.routers import supporters, visits
 from app.services.rate_limit import TokenBucketRateLimiter
 from app.services.supabase import SupabaseService
 from app.services.telegram import TelegramService
+from app.services.telegram_commands import TelegramCommandService
 from app.services.visit_crypto import VisitCryptoService
 from app.services.visits import VisitService
 
-APP_VERSION = "2.4.0-audio"
+APP_VERSION = "2.4.1-audio"
 
 OPENAPI_TAGS = [
     {
@@ -88,6 +89,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.telegram = TelegramService(runtime_settings, client)
             app.state.visit_crypto = VisitCryptoService(runtime_settings)
             app.state.admin_rate_limiter = TokenBucketRateLimiter()
+            app.state.telegram_webhook_rate_limiter = TokenBucketRateLimiter()
+            app.state.telegram_commands = TelegramCommandService(
+                runtime_settings,
+                app.state.supabase,
+                app.state.telegram,
+            )
             app.state.visits = VisitService(
                 runtime_settings,
                 app.state.supabase,
@@ -110,6 +117,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app,
                 api_prefix=runtime_settings.api_prefix,
             )
+            if (
+                runtime_settings.telegram_commands_enabled
+                and runtime_settings.telegram_auto_configure_webhook
+            ):
+                commands_result = await app.state.telegram.configure_commands()
+                app.state.telegram_commands_configured = commands_result.ok
+                app.state.telegram_commands_configuration_error = (
+                    commands_result.error or ""
+                )
             yield
         finally:
             await close_audio_extension(app)

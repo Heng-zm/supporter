@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
-from datetime import datetime, timezone
 import hashlib
 import json
 import logging
-from pathlib import Path
 import secrets
 import time
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -923,7 +923,7 @@ class AudioStore:
                 return current
 
             old_history = await self.get_history(force=True)
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             version = f"{now.strftime('%Y%m%dT%H%M%SZ')}-{secrets.token_hex(6)}"
 
             if self.settings.encryption_enabled:

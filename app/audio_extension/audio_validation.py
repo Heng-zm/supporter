@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from pathlib import PurePath
 import re
-
+from pathlib import PurePath
 
 MIME_ALIASES = {
     "audio/mp3": "audio/mpeg",
@@ -109,7 +108,8 @@ def validate_audio_bytes(
         )
     if extension_mime and extension_mime != detected:
         raise ValueError(
-            f"Audio file extension mismatch: extension indicates {extension_mime}, detected {detected}."
+            "Audio file extension mismatch: "
+            f"extension indicates {extension_mime}, detected {detected}."
         )
 
     file_name_clean = sanitize_file_name(file_name, detected)

@@ -17,7 +17,6 @@ from app.services.telegram_commands import TelegramCommandService
 from app.utils.network import client_ip
 from app.utils.security import ip_is_trusted, secure_equals, sha256_text
 
-
 logger = logging.getLogger("app.telegram_webhook")
 router = APIRouter(prefix="/telegram", tags=["telegram"])
 
@@ -80,7 +79,7 @@ async def telegram_webhook(
 
     try:
         await commands.handle(update)
-    except Exception:
+    except Exception as exc:
         request_id = getattr(request.state, "request_id", "unknown")
         logger.exception(
             "Telegram update failed: request_id=%s update_id=%s",
@@ -91,5 +90,5 @@ async def telegram_webhook(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Telegram command processing failed.",
             headers={"Cache-Control": "no-store"},
-        )
+        ) from exc
     return {"ok": True}

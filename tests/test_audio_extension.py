@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import wave
 from dataclasses import replace
 from pathlib import Path
-import wave
 
 import httpx
 
@@ -11,6 +11,7 @@ from app.audio_extension.audio_validation import detect_audio_mime
 from app.audio_extension.config import AudioSettings
 from app.audio_extension.store import AudioStore
 from app.audio_extension.telegram import TelegramAudioController
+from app.config import Settings
 
 
 def make_wav() -> bytes:
@@ -234,6 +235,7 @@ def test_telegram_audio_command_replaces_track(tmp_path: Path) -> None:
 
 def test_public_audio_router(tmp_path: Path) -> None:
     from fastapi import FastAPI
+
     from app.audio_extension.router import router
 
     async def run() -> None:
@@ -721,6 +723,19 @@ def test_configure_audio_telegram_webhook_and_verify(monkeypatch) -> None:
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         try:
             app = FastAPI()
+            app.state.settings = Settings(
+                require_encrypted_visits=False,
+                supabase_url="https://test.supabase.co",
+                supabase_secret_key="server-secret",
+                telegram_bot_token="123456:test-token",
+                telegram_chat_id="100",
+                telegram_commands_enabled=True,
+                telegram_webhook_secret=(
+                    "safe_secret_123456789012345"
+                ),
+                telegram_webhook_url=expected_url,
+                telegram_auto_configure_webhook=True,
+            )
             app.state.audio_http_client = client
             configured = await configure_audio_telegram_webhook(
                 app,
@@ -732,15 +747,18 @@ def test_configure_audio_telegram_webhook_and_verify(monkeypatch) -> None:
             assert len(calls) == 2
             set_payload = calls[0][1]
             assert set_payload["url"] == expected_url
-            assert set_payload["secret_token"] == "safe_secret_123"
-            assert set_payload["allowed_updates"] == ["message"]
+            assert set_payload["secret_token"] == "safe_secret_123456789012345"
+            assert set_payload["allowed_updates"] == ["message", "callback_query"]
             assert set_payload["drop_pending_updates"] is False
             assert set_payload["max_connections"] == 10
         finally:
             await client.aclose()
 
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:test-token")
-    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "safe_secret_123")
+    monkeypatch.setenv(
+        "TELEGRAM_WEBHOOK_SECRET",
+        "safe_secret_123456789012345",
+    )
     monkeypatch.setenv(
         "TELEGRAM_WEBHOOK_URL",
         "https://supporter-ipio.onrender.com/api/telegram/webhook",
@@ -763,6 +781,23 @@ def test_webhook_settings_derive_render_url(monkeypatch) -> None:
         "https://supporter-ipio.onrender.com/api/telegram/webhook"
     )
     assert cfg.configuration_error == ""
+
+
+def test_webhook_auto_configuration_is_opt_in(monkeypatch) -> None:
+    from app.audio_extension.webhook import AudioTelegramWebhookSettings
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:test-token")
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "safe_secret")
+    monkeypatch.setenv(
+        "TELEGRAM_WEBHOOK_URL",
+        "https://supporter-ipio.onrender.com/api/telegram/webhook",
+    )
+    monkeypatch.delenv("TELEGRAM_AUTO_CONFIGURE_WEBHOOK", raising=False)
+
+    cfg = AudioTelegramWebhookSettings.from_env(api_prefix="/api")
+
+    assert cfg.configuration_error == ""
+    assert cfg.auto_configure is False
 
 
 def test_packaged_main_mounts_telegram_webhook() -> None:
@@ -981,6 +1016,7 @@ def test_telegram_download_rejects_oversized_stream(tmp_path: Path) -> None:
 
 def test_metadata_etag_returns_not_modified(tmp_path: Path) -> None:
     from fastapi import FastAPI
+
     from app.audio_extension.router import router
 
     async def run() -> None:
@@ -1266,6 +1302,7 @@ def test_encrypted_history_and_telegram_rollback(tmp_path: Path) -> None:
 
 def test_encrypted_streaming_range_response(tmp_path: Path) -> None:
     from fastapi import FastAPI
+
     from app.audio_extension.router import router
 
     async def run() -> None:
@@ -1460,6 +1497,7 @@ def test_history_limit_deletes_pruned_encrypted_objects(tmp_path: Path) -> None:
 
 def test_if_range_mismatch_returns_full_encrypted_audio(tmp_path: Path) -> None:
     from fastapi import FastAPI
+
     from app.audio_extension.router import router
 
     async def run() -> None:

@@ -1,4 +1,4 @@
-# Ozo Donation API v1.6.0 — high-security server
+# Ozo Donation API v2.4.1-audio — high-security server
 
 FastAPI backend for the public supporter list, encrypted visit notifications,
 and the Telegram step-by-step supporter manager.
@@ -13,6 +13,8 @@ and the Telegram step-by-step supporter manager.
 - REST supporter administration is disabled by default.
 - When REST administration is enabled, it requires an API key, IP allowlist, and rate limiting.
 - Telegram webhooks require JSON, the secret header, optional source-IP filtering, and feature-level rate limiting.
+- One replay-protected webhook safely dispatches both audio management and supporter commands.
+- Telegram webhook auto-configuration is opt-in and includes callback queries when commands are enabled.
 - Telegram network errors no longer risk writing the bot token into logs.
 - Production Supabase errors no longer log provider details that may contain submitted data.
 - Public avatar URLs must use HTTPS and cannot point to localhost or private literal IP addresses.

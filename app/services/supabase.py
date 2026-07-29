@@ -10,7 +10,6 @@ import httpx
 
 from app.config import Settings
 
-
 PUBLIC_SUPPORTER_COLUMNS = (
     "id,name,amount,currency,message,avatar_url,payment_method,created_at"
 )

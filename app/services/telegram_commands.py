@@ -24,7 +24,6 @@ from app.models import (
 from app.services.supabase import SupabaseError, SupabaseService
 from app.services.telegram import TelegramService
 
-
 logger = logging.getLogger("app.telegram_commands")
 
 PAGE_SIZE = 5

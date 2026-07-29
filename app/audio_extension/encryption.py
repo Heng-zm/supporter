@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import base64
 import hashlib
 import json
 import math
 import secrets
 import struct
-from typing import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping
+from dataclasses import dataclass
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM

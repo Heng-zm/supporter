@@ -14,7 +14,6 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from app.config import Settings
 from app.models import EncryptedVisitEnvelope, VisitPayload
 
-
 ENCRYPTION_NAME = "rsa-oaep-aes-gcm-v1"
 AAD = b"ozo-visit-v1"
 logger = logging.getLogger("app.visit_crypto")

@@ -23,7 +23,6 @@ from app.models import (
 )
 from app.services.supabase import SupabaseError, SupabaseService
 
-
 logger = logging.getLogger("app.supporters")
 router = APIRouter(prefix="/supporters", tags=["supporters"])
 

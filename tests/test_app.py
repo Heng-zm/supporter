@@ -4,6 +4,7 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import APP_VERSION, create_app
+from app.services.telegram_commands import TelegramCommandService
 
 
 def test_health_and_routes() -> None:
@@ -78,6 +79,80 @@ def test_production_rejects_malformed_required_encryption_key() -> None:
         assert "Encrypted visits are required but unavailable" in str(exc)
     else:
         raise AssertionError("Production startup should reject an invalid encryption key.")
+
+
+def test_packaged_webhook_dispatches_supporter_commands() -> None:
+    settings = Settings(
+        app_environment="test",
+        require_encrypted_visits=False,
+        trust_proxy_headers=False,
+        supabase_url="https://test.supabase.co",
+        supabase_secret_key="server-secret",
+        telegram_bot_token="test-bot-token",
+        telegram_chat_id="123",
+        telegram_commands_enabled=True,
+        telegram_webhook_secret="telegram-webhook-secret-123456",
+    )
+    app = create_app(settings)
+    handled_updates: list[int] = []
+
+    class RecordingCommands:
+        async def handle(self, update) -> None:
+            handled_updates.append(update.update_id)
+
+    with TestClient(app) as client:
+        assert isinstance(app.state.telegram_commands, TelegramCommandService)
+        app.state.telegram_commands = RecordingCommands()
+        response = client.post(
+            "/api/telegram/webhook",
+            headers={
+                "Content-Type": "application/json",
+                "X-Telegram-Bot-Api-Secret-Token": (
+                    "telegram-webhook-secret-123456"
+                ),
+            },
+            json={
+                "update_id": 501,
+                "message": {
+                    "message_id": 10,
+                    "from": {
+                        "id": 123,
+                        "is_bot": False,
+                        "first_name": "Admin",
+                    },
+                    "chat": {"id": 123, "type": "private"},
+                    "text": "/help",
+                },
+            },
+        )
+        duplicate = client.post(
+            "/api/telegram/webhook",
+            headers={
+                "Content-Type": "application/json",
+                "X-Telegram-Bot-Api-Secret-Token": (
+                    "telegram-webhook-secret-123456"
+                ),
+            },
+            json={
+                "update_id": 501,
+                "message": {
+                    "message_id": 10,
+                    "from": {
+                        "id": 123,
+                        "is_bot": False,
+                        "first_name": "Admin",
+                    },
+                    "chat": {"id": 123, "type": "private"},
+                    "text": "/help",
+                },
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "handled": True}
+    assert duplicate.status_code == 200
+    assert duplicate.json()["duplicate"] is True
+    assert handled_updates == [501]
 
 
 async def test_body_limit_rejects_chunked_payload_without_content_length() -> None:

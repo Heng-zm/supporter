@@ -12,7 +12,6 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from app.config import Settings
 from app.utils.network import request_is_https_scope
 
-
 logger = logging.getLogger("app.request")
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{8,64}$")
 _HEALTH_PATHS = frozenset({"/health"})

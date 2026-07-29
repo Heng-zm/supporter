@@ -11,7 +11,6 @@ from app.models import VisitPayload, VisitResponse
 from app.services.visit_crypto import ENCRYPTION_NAME, VisitCryptoService
 from app.services.visits import VisitRateLimitError, VisitService
 
-
 logger = logging.getLogger("app.visits")
 router = APIRouter(prefix="/website", tags=["visits"])
 

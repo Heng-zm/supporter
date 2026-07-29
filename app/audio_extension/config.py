@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import base64
-from dataclasses import dataclass
 import json
 import os
-from pathlib import Path
 import re
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any
 
 from .source_settings import (
     AUDIO_AUTO_CREATE_BUCKET,
@@ -197,7 +198,7 @@ class AudioSettings:
     response_chunk_bytes: int = 64 * 1024
 
     @classmethod
-    def from_env(cls) -> "AudioSettings":
+    def from_env(cls) -> AudioSettings:
         """Load secrets from environment and non-secret settings from source."""
         _validate_source_settings()
 
