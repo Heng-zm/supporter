@@ -21,7 +21,9 @@ and the Telegram step-by-step supporter manager.
 - Uvicorn runs without proxy trust, access logs, or a server banner and uses bounded concurrency and request recycling.
 - Docker runs as a non-root user and validates installed Python dependencies during image creation.
 
-No Supabase migration is required when upgrading from v1.5.0.
+Version 2.4.0 adds structured website-visit analytics. Run
+`supabase/supabase_migration_v2_4_0_visit_analytics.sql` in the Supabase SQL
+Editor before deploying this release.
 
 ## Deploy safely
 
@@ -97,6 +99,95 @@ referrers before storage or Telegram delivery:
 
 ```env
 VISIT_STORE_URL_QUERY=false
+VISIT_DETAILED_ANALYTICS_ENABLED=true
+```
+
+Detailed analytics accept bounded campaign attribution, navigation timing,
+network quality, device capability, and first-party session context. Supplied
+session IDs are salted and hashed before storage or Telegram delivery. Only
+allowlisted `utm_source`, `utm_medium`, `utm_campaign`, `utm_id`, `utm_term`,
+and `utm_content` query values are retained; all other query parameters remain
+excluded when `VISIT_STORE_URL_QUERY=false`.
+
+The encrypted visit payload may include:
+
+```json
+{
+  "connection": {
+    "type": "wifi",
+    "effectiveType": "4g",
+    "downlinkMbps": 25.5,
+    "rttMs": 42,
+    "saveData": false
+  },
+  "navigation": {
+    "type": "navigate",
+    "durationMs": 900,
+    "domContentLoadedMs": 480,
+    "loadTimeMs": 760,
+    "transferSizeBytes": 120000
+  },
+  "capabilities": {
+    "memoryGb": 8,
+    "logicalProcessors": 8,
+    "maxTouchPoints": 5,
+    "colorDepth": 24,
+    "cookiesEnabled": true,
+    "doNotTrack": false
+  },
+  "session": {
+    "id": "first-party-session-id",
+    "pageViews": 4,
+    "returningVisitor": true
+  }
+}
+```
+
+The website must add these fields to the existing plaintext visit payload
+before encryption. A browser collector can use the following values after any
+analytics consent required by your jurisdiction:
+
+```js
+const navigation = performance.getEntriesByType("navigation")[0];
+const network = navigator.connection;
+const existingSession = localStorage.getItem("visit_session_id");
+const sessionId = existingSession || crypto.randomUUID();
+const pageViews = Number(localStorage.getItem("visit_page_views") || "0") + 1;
+
+localStorage.setItem("visit_session_id", sessionId);
+localStorage.setItem("visit_page_views", String(pageViews));
+
+const detailedVisitData = {
+  connection: {
+    online: navigator.onLine,
+    type: network?.type || "Unknown",
+    effectiveType: network?.effectiveType || "Unknown",
+    downlinkMbps: network?.downlink ?? null,
+    rttMs: network?.rtt ?? null,
+    saveData: network?.saveData || false
+  },
+  navigation: navigation ? {
+    type: navigation.type,
+    redirectCount: navigation.redirectCount,
+    durationMs: navigation.duration,
+    domContentLoadedMs: navigation.domContentLoadedEventEnd,
+    loadTimeMs: navigation.loadEventEnd,
+    transferSizeBytes: navigation.transferSize
+  } : {},
+  capabilities: {
+    memoryGb: navigator.deviceMemory ?? null,
+    logicalProcessors: navigator.hardwareConcurrency ?? null,
+    maxTouchPoints: navigator.maxTouchPoints || 0,
+    colorDepth: screen.colorDepth,
+    cookiesEnabled: navigator.cookieEnabled,
+    doNotTrack: navigator.doNotTrack === "1"
+  },
+  session: {
+    id: sessionId,
+    pageViews,
+    returningVisitor: Boolean(existingSession)
+  }
+};
 ```
 
 ### API documentation

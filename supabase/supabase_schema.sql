@@ -45,6 +45,7 @@ create table if not exists public.visit_events (
     timezone text,
     screen jsonb not null default '{}'::jsonb,
     connection jsonb not null default '{}'::jsonb,
+    analytics jsonb not null default '{}'::jsonb,
     user_agent text not null,
     ip_hash text not null,
     ip_masked text,
@@ -61,6 +62,7 @@ alter table public.visit_events add column if not exists telegram_sent boolean n
 alter table public.visit_events add column if not exists telegram_message_id text;
 alter table public.visit_events add column if not exists telegram_error varchar(500);
 alter table public.visit_events add column if not exists created_at timestamptz not null default now();
+alter table public.visit_events add column if not exists analytics jsonb not null default '{}'::jsonb;
 
 create unique index if not exists visit_events_dedupe_key_idx
     on public.visit_events (dedupe_key);

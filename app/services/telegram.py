@@ -9,7 +9,6 @@ import httpx
 
 from app.config import Settings
 
-
 TRANSIENT_TELEGRAM_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
@@ -116,14 +115,33 @@ class TelegramService:
     def build_visit_message(self, visit: dict[str, Any]) -> str:
         screen = visit.get("screen") or {}
         connection = visit.get("connection") or {}
+        analytics = visit.get("analytics") or {}
+        campaign = analytics.get("campaign") or {}
+        navigation = analytics.get("navigation") or {}
+        capabilities = analytics.get("capabilities") or {}
+        session = analytics.get("session") or {}
+        client_hints = analytics.get("clientHints") or {}
+
         screen_text = (
             f"{screen.get('width', 0)}x{screen.get('height', 0)} "
             f"@{screen.get('devicePixelRatio', 1)}x"
         )
+
+        network_parts = [str(connection.get("effectiveType") or "Unknown")]
+        if connection.get("downlinkMbps") is not None:
+            network_parts.append(f"{connection['downlinkMbps']:g} Mbps")
+        if connection.get("rttMs") is not None:
+            network_parts.append(f"{connection['rttMs']} ms RTT")
+        if connection.get("saveData"):
+            network_parts.append("data saver")
+        if connection.get("online") is False:
+            network_parts.append("offline")
+
         lines = [
             "🌐 <b>Website Visit Alert</b>",
             "",
             f"📅 <b>Time:</b> {self._text(visit.get('local_time') or visit.get('timestamp'))}",
+            f"📄 <b>Page:</b> {self._text(visit.get('title'))}",
             f"🔗 <b>URL:</b> {self._text(visit.get('url'), maximum=1200)}",
             f"↪️ <b>Referrer:</b> {self._text(visit.get('referrer'), 'Direct visit', 1200)}",
             f"📱 <b>Device:</b> {self._text(visit.get('device'))}",
@@ -134,12 +152,79 @@ class TelegramService:
             f"🌍 <b>Language:</b> {self._text(visit.get('language'))}",
             f"🕒 <b>Timezone:</b> {self._text(visit.get('timezone'))}",
             f"📍 <b>Location:</b> {self._text(visit.get('location'))}",
-            f"📶 <b>Network:</b> {self._text(connection.get('effectiveType'))}",
+            f"📶 <b>Network:</b> {self._text(' · '.join(network_parts))}",
+        ]
+
+        campaign_parts = [
+            str(campaign.get(field) or "")
+            for field in ("source", "medium", "name")
+            if campaign.get(field)
+        ]
+        if campaign_parts:
+            lines.append(
+                f"🎯 <b>Campaign:</b> {self._text(' / '.join(campaign_parts))}"
+            )
+
+        performance_parts: list[str] = []
+        navigation_type = str(navigation.get("type") or "").strip()
+        if navigation_type and navigation_type != "Unknown":
+            performance_parts.append(navigation_type)
+        timing_fields = (
+            ("loadTimeMs", "load"),
+            ("domContentLoadedMs", "DOM"),
+            ("durationMs", "total"),
+        )
+        for field, label in timing_fields:
+            value = navigation.get(field)
+            if isinstance(value, (int, float)):
+                performance_parts.append(f"{label} {value:g} ms")
+        if performance_parts:
+            lines.append(
+                f"⚡ <b>Performance:</b> {self._text(' · '.join(performance_parts))}"
+            )
+
+        capability_parts: list[str] = []
+        if capabilities.get("memoryGb") is not None:
+            capability_parts.append(f"{capabilities['memoryGb']:g} GB RAM")
+        if capabilities.get("logicalProcessors") is not None:
+            capability_parts.append(f"{capabilities['logicalProcessors']} cores")
+        if capabilities.get("maxTouchPoints"):
+            capability_parts.append(f"{capabilities['maxTouchPoints']} touch points")
+        if capabilities.get("doNotTrack") is True:
+            capability_parts.append("DNT enabled")
+        if capability_parts:
+            lines.append(
+                f"🧩 <b>Capabilities:</b> {self._text(' · '.join(capability_parts))}"
+            )
+
+        if session:
+            session_parts = [
+                f"{session.get('pageViews', 1)} page view(s)",
+                "returning" if session.get("returningVisitor") else "new",
+            ]
+            if session.get("id"):
+                session_parts.insert(0, str(session["id"]))
+            lines.append(
+                f"🔁 <b>Session:</b> {self._text(' · '.join(session_parts))}"
+            )
+
+        if client_hints.get("brands"):
+            lines.append(
+                f"🧭 <b>Client:</b> {self._text(client_hints.get('brands'), maximum=300)}"
+            )
+        if analytics.get("requestId"):
+            lines.append(
+                f"🧾 <b>Request:</b> {self._text(analytics.get('requestId'), maximum=64)}"
+            )
+
+        lines.extend(
+            [
             f"🔐 <b>Visitor:</b> {self._text(visit.get('visitor_id'))} / "
             f"{self._text(visit.get('masked_ip'))}",
             "",
-            "👤 A user opened the donation website.",
-        ]
+                "👤 A user opened the donation website.",
+            ]
+        )
         message = "\n".join(lines)
         return message if len(message) <= 3900 else f"{message[:3899]}…"
 

@@ -11,7 +11,6 @@ from urllib.parse import urlparse
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
 SUPPORTERS_CACHE_TTL_SECONDS = 60
 SUPPORTERS_STALE_CACHE_SECONDS = 86400
 DEFAULT_TRUSTED_PROXY_NETWORKS = (
@@ -159,6 +158,7 @@ class Settings(BaseSettings):
     visit_alert_cooldown_minutes: int = Field(default=30, ge=1, le=1440)
     visit_rate_limit_per_minute: int = Field(default=20, ge=1, le=1000)
     visit_store_url_query: bool = False
+    visit_detailed_analytics_enabled: bool = True
     require_visit_storage: bool = False
 
     @field_validator("api_prefix")
@@ -239,7 +239,7 @@ class Settings(BaseSettings):
         )
 
     @model_validator(mode="after")
-    def validate_settings(self) -> "Settings":
+    def validate_settings(self) -> Settings:
         placeholder_salts = {
             "",
             "development-only-change-me",

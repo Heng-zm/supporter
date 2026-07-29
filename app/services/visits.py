@@ -4,9 +4,9 @@ import asyncio
 import heapq
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from fastapi import Request
 
@@ -17,6 +17,15 @@ from app.services.supabase import SupabaseError, SupabaseService
 from app.services.telegram import TelegramResult, TelegramService
 from app.utils.network import client_ip, proxy_is_trusted
 from app.utils.security import mask_ip, random_id, sha256_text
+
+_CAMPAIGN_QUERY_FIELDS = {
+    "utm_source": "source",
+    "utm_medium": "medium",
+    "utm_campaign": "name",
+    "utm_id": "campaignId",
+    "utm_term": "term",
+    "utm_content": "content",
+}
 
 
 def _sanitize_url(value: str, *, keep_query: bool) -> str:
@@ -57,6 +66,48 @@ def _clean_field(value: str, maximum: int) -> str:
         if ord(character) >= 32 and ord(character) != 127
     )
     return " ".join(text.split())[:maximum]
+
+
+def _campaign_from_url(value: str) -> dict[str, str]:
+    try:
+        parsed = urlsplit(str(value or "")[:1500])
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            return {}
+        query_items = parse_qsl(
+            parsed.query,
+            keep_blank_values=False,
+            max_num_fields=50,
+        )
+    except ValueError:
+        return {}
+
+    campaign: dict[str, str] = {}
+    for key, value in query_items:
+        field = _CAMPAIGN_QUERY_FIELDS.get(key.lower())
+        if field and field not in campaign:
+            cleaned = _clean_field(value, 160)
+            if cleaned:
+                campaign[field] = cleaned
+    return campaign
+
+
+def _request_client_hints(request: Request) -> dict[str, str | bool]:
+    hints: dict[str, str | bool] = {}
+    header_fields = {
+        "sec-ch-ua": ("brands", 300),
+        "sec-ch-ua-platform": ("platform", 80),
+        "sec-ch-ua-platform-version": ("platformVersion", 80),
+        "accept-language": ("acceptLanguage", 160),
+    }
+    for header, (field, maximum) in header_fields.items():
+        cleaned = _clean_field(request.headers.get(header, ""), maximum)
+        if cleaned:
+            hints[field] = cleaned
+
+    mobile = request.headers.get("sec-ch-ua-mobile", "").strip()
+    if mobile in {"?0", "?1"}:
+        hints["mobile"] = mobile == "?1"
+    return hints
 
 
 class VisitRateLimitError(RuntimeError):
@@ -158,7 +209,7 @@ class VisitService:
         request: Request,
         payload: VisitPayload,
     ) -> tuple[dict[str, Any], dict[str, Any], str, str]:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         server_timestamp = now.isoformat()
         ip = self._client_ip(request)
         user_agent = _clean_field(request.headers.get("user-agent", "Unknown"), 1000) or "Unknown"
@@ -180,7 +231,55 @@ class VisitService:
         location, country, region, city = self._location(request)
         screen = payload.screen.model_dump()
         connection = payload.connection.model_dump()
+        connection["type"] = _clean_field(str(connection.get("type", "")), 40)
+        connection["effectiveType"] = _clean_field(
+            str(connection.get("effectiveType", "")),
+            80,
+        )
         viewport = f"{screen.get('viewportWidth', 0)}x{screen.get('viewportHeight', 0)}"
+
+        analytics: dict[str, Any] = {}
+        if self.settings.visit_detailed_analytics_enabled:
+            payload_campaign = {
+                key: _clean_field(str(value), 160)
+                for key, value in payload.campaign.model_dump(exclude_none=True).items()
+                if _clean_field(str(value), 160)
+            }
+            campaign = {
+                **payload_campaign,
+                **_campaign_from_url(payload.url),
+            }
+
+            navigation = payload.navigation.model_dump(exclude_none=True)
+            navigation["type"] = _clean_field(
+                str(navigation.get("type", "Unknown")),
+                40,
+            )
+            capabilities = payload.capabilities.model_dump(exclude_none=True)
+
+            raw_session_id = _clean_field(payload.session.id or "", 128)
+            session: dict[str, Any] = {
+                "pageViews": payload.session.pageViews,
+                "returningVisitor": payload.session.returningVisitor,
+            }
+            if raw_session_id:
+                session["id"] = sha256_text(
+                    f"{self.settings.visit_hash_salt}:session:{raw_session_id}"
+                )[:16]
+
+            analytics = {
+                "campaign": campaign,
+                "navigation": navigation,
+                "capabilities": capabilities,
+                "session": session,
+                "clientHints": _request_client_hints(request),
+            }
+            request_id = _clean_field(
+                str(getattr(request.state, "request_id", "")),
+                64,
+            )
+            if request_id:
+                analytics["requestId"] = request_id
 
         public_visit = {
             "event_id": random_id(),
@@ -197,6 +296,7 @@ class VisitService:
             "timezone": _clean_field(payload.timezone, 100),
             "screen": screen,
             "connection": connection,
+            "analytics": analytics,
             "viewport": viewport,
             "location": location,
             "visitor_id": ip_hash[:12],
@@ -218,6 +318,7 @@ class VisitService:
             "timezone": public_visit["timezone"],
             "screen": screen,
             "connection": connection,
+            "analytics": analytics,
             "user_agent": user_agent,
             "ip_hash": ip_hash,
             "ip_masked": public_visit["masked_ip"],
@@ -245,7 +346,7 @@ class VisitService:
         try:
             if self.supabase.enabled:
                 since_iso = (
-                    datetime.now(timezone.utc) - timedelta(seconds=cooldown_seconds)
+                    datetime.now(UTC) - timedelta(seconds=cooldown_seconds)
                 ).isoformat()
                 try:
                     stored = await self.supabase.find_recent_visit(

@@ -35,6 +35,7 @@ create table if not exists public.visit_events (
   timezone text,
   screen jsonb not null default '{}'::jsonb,
   connection jsonb not null default '{}'::jsonb,
+  analytics jsonb not null default '{}'::jsonb,
   user_agent text,
   ip_hash text,
   ip_masked text,

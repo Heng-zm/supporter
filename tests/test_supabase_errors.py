@@ -100,3 +100,17 @@ def test_schema_uses_non_partial_telegram_unique_index() -> None:
     index_section = schema.split("create unique index supporters_telegram_update_id_idx", 1)[1]
     index_section = index_section.split(";", 1)[0]
     assert "where telegram_update_id is not null" not in index_section.lower()
+
+
+def test_schema_and_migration_include_visit_analytics() -> None:
+    from pathlib import Path
+
+    supabase = Path(__file__).parents[1] / "supabase"
+    schema = (supabase / "supabase_schema.sql").read_text()
+    migration = (
+        supabase / "supabase_migration_v2_4_0_visit_analytics.sql"
+    ).read_text()
+
+    assert "analytics jsonb not null default '{}'::jsonb" in schema.lower()
+    assert "add column if not exists analytics jsonb" in migration.lower()
+    assert "notify pgrst, 'reload schema'" in migration.lower()

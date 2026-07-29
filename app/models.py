@@ -10,7 +10,6 @@ from uuid import UUID
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
-
 MAX_SUPPORTER_AMOUNT = Decimal("1000000000")
 
 
@@ -161,7 +160,7 @@ class SupporterUpdate(BaseModel):
         return _validate_avatar_url(None if value is None else str(value))
 
     @model_validator(mode="after")
-    def validate_patch(self) -> "SupporterUpdate":
+    def validate_patch(self) -> SupporterUpdate:
         if not self.model_fields_set:
             raise ValueError("At least one supporter field is required.")
 
@@ -216,8 +215,60 @@ class ConnectionInfo(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     online: bool = True
+    type: str = Field(default="Unknown", max_length=40)
     effectiveType: str = Field(default="Unknown", max_length=80)
+    downlinkMbps: float | None = Field(default=None, ge=0, le=100000)
+    rttMs: int | None = Field(default=None, ge=0, le=600000)
     saveData: bool = False
+
+
+class NavigationInfo(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    type: str = Field(default="Unknown", max_length=40)
+    redirectCount: int = Field(default=0, ge=0, le=100)
+    durationMs: float | None = Field(default=None, ge=0, le=3600000)
+    domContentLoadedMs: float | None = Field(default=None, ge=0, le=3600000)
+    loadTimeMs: float | None = Field(default=None, ge=0, le=3600000)
+    transferSizeBytes: int | None = Field(default=None, ge=0, le=1000000000)
+
+
+class DeviceCapabilities(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    memoryGb: float | None = Field(default=None, ge=0, le=1024)
+    logicalProcessors: int | None = Field(default=None, ge=0, le=1024)
+    maxTouchPoints: int = Field(default=0, ge=0, le=100)
+    colorDepth: int | None = Field(default=None, ge=0, le=128)
+    cookiesEnabled: bool | None = None
+    doNotTrack: bool | None = None
+
+
+class SessionInfo(BaseModel):
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    id: str | None = Field(
+        default=None,
+        max_length=128,
+        validation_alias=AliasChoices("id", "sessionId", "session_id"),
+    )
+    pageViews: int = Field(default=1, ge=1, le=1000000)
+    returningVisitor: bool = False
+
+
+class CampaignInfo(BaseModel):
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    source: str | None = Field(default=None, max_length=120)
+    medium: str | None = Field(default=None, max_length=120)
+    name: str | None = Field(
+        default=None,
+        max_length=160,
+        validation_alias=AliasChoices("name", "campaign"),
+    )
+    campaignId: str | None = Field(default=None, max_length=120)
+    term: str | None = Field(default=None, max_length=160)
+    content: str | None = Field(default=None, max_length=160)
 
 
 class VisitPayload(BaseModel):
@@ -254,6 +305,10 @@ class VisitPayload(BaseModel):
         default_factory=ConnectionInfo,
         validation_alias=AliasChoices("connection", "network"),
     )
+    navigation: NavigationInfo = Field(default_factory=NavigationInfo)
+    capabilities: DeviceCapabilities = Field(default_factory=DeviceCapabilities)
+    session: SessionInfo = Field(default_factory=SessionInfo)
+    campaign: CampaignInfo = Field(default_factory=CampaignInfo)
 
 
 class EncryptedVisitEnvelope(BaseModel):

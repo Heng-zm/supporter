@@ -32,7 +32,7 @@ from app.services.telegram import TelegramService
 from app.services.visit_crypto import VisitCryptoService
 from app.services.visits import VisitService
 
-APP_VERSION = "2.3.1-audio"
+APP_VERSION = "2.4.0-audio"
 
 OPENAPI_TAGS = [
     {
