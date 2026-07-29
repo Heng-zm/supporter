@@ -94,7 +94,9 @@ def test_telegram_permission_error_is_actionable() -> None:
 def test_schema_uses_non_partial_telegram_unique_index() -> None:
     from pathlib import Path
 
-    schema = (Path(__file__).parents[1] / "supabase_schema.sql").read_text()
+    schema = (
+        Path(__file__).parents[1] / "supabase" / "supabase_schema.sql"
+    ).read_text()
     index_section = schema.split("create unique index supporters_telegram_update_id_idx", 1)[1]
     index_section = index_section.split(";", 1)[0]
     assert "where telegram_update_id is not null" not in index_section.lower()

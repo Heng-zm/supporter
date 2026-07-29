@@ -22,6 +22,27 @@ def test_health_and_routes() -> None:
         assert "/api/telegram/webhook" in paths
 
 
+def test_root_supports_browser_and_api_clients() -> None:
+    settings = Settings(
+        require_encrypted_visits=False,
+        trust_proxy_headers=False,
+    )
+    app = create_app(settings)
+    with TestClient(app) as client:
+        browser_response = client.get("/", headers={"Accept": "text/html"})
+        api_response = client.get("/", headers={"Accept": "application/json"})
+
+    assert browser_response.status_code == 200
+    assert browser_response.headers["content-type"].startswith("text/html")
+    assert "Donation and audio, delivered reliably." in browser_response.text
+    assert "2.3.1-audio" in browser_response.text
+    assert "style-src 'sha256-" in browser_response.headers["content-security-policy"]
+
+    assert api_response.status_code == 200
+    assert api_response.json()["status"] == "operational"
+    assert api_response.json()["version"] == "2.3.1-audio"
+
+
 def test_body_limit_rejects_large_payload() -> None:
     settings = Settings(
         require_encrypted_visits=False,

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 import time
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 
 import httpx
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 
@@ -18,15 +18,44 @@ from app.audio_extension import (
     start_audio_extension,
 )
 from app.config import Settings, get_settings
+from app.landing import build_landing_page
 from app.middleware.body_limit import RequestBodyLimitMiddleware
+from app.middleware.security import (
+    HTTPSRequiredMiddleware,
+    RequestContextMiddleware,
+    SecurityHeadersMiddleware,
+)
 from app.routers import supporters, visits
+from app.services.rate_limit import TokenBucketRateLimiter
 from app.services.supabase import SupabaseService
 from app.services.telegram import TelegramService
 from app.services.visit_crypto import VisitCryptoService
 from app.services.visits import VisitService
 
+APP_VERSION = "2.3.1-audio"
 
-APP_VERSION = "2.3.0-audio"
+OPENAPI_TAGS = [
+    {
+        "name": "system",
+        "description": "Service health, availability, and deployment information.",
+    },
+    {
+        "name": "supporters",
+        "description": "Public supporter data and authenticated administration.",
+    },
+    {
+        "name": "visits",
+        "description": "Encrypted website-visit processing and deduplication.",
+    },
+    {
+        "name": "audio",
+        "description": "Versioned audio metadata and integrity-checked streaming.",
+    },
+    {
+        "name": "telegram",
+        "description": "Authenticated Telegram automation webhooks.",
+    },
+]
 
 
 def _unique_origins(*origin_groups: list[str] | tuple[str, ...]) -> list[str]:
@@ -52,18 +81,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         timeout = httpx.Timeout(runtime_settings.request_timeout_seconds)
         client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
 
-        app.state.settings = runtime_settings
-        app.state.http_client = client
-        app.state.supabase = SupabaseService(runtime_settings, client)
-        app.state.telegram = TelegramService(runtime_settings, client)
-        app.state.visit_crypto = VisitCryptoService(runtime_settings)
-        app.state.visits = VisitService(
-            runtime_settings,
-            app.state.supabase,
-            app.state.telegram,
-        )
-
         try:
+            app.state.settings = runtime_settings
+            app.state.http_client = client
+            app.state.supabase = SupabaseService(runtime_settings, client)
+            app.state.telegram = TelegramService(runtime_settings, client)
+            app.state.visit_crypto = VisitCryptoService(runtime_settings)
+            app.state.admin_rate_limiter = TokenBucketRateLimiter()
+            app.state.visits = VisitService(
+                runtime_settings,
+                app.state.supabase,
+                app.state.telegram,
+            )
+
+            if (
+                runtime_settings.require_encrypted_visits
+                and not app.state.visit_crypto.enabled
+            ):
+                reason = app.state.visit_crypto.load_error or "No private key was loaded."
+                raise RuntimeError(
+                    f"Encrypted visits are required but unavailable: {reason}"
+                )
+
             # Audio uploads/downloads use their own client because Telegram and
             # audio files need a longer timeout than normal supporter requests.
             await start_audio_extension(app)
@@ -76,11 +115,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await close_audio_extension(app)
             await client.aclose()
 
+    docs_enabled = (
+        runtime_settings.enable_api_docs
+        and not runtime_settings.is_production
+    )
     app = FastAPI(
         title=runtime_settings.app_name,
+        summary="Secure donation, visit, and audio backend",
+        description=(
+            "Production-focused API for supporter data, encrypted website-visit "
+            "processing, Telegram automation, and versioned audio delivery."
+        ),
         version=APP_VERSION,
         debug=runtime_settings.debug,
         lifespan=lifespan,
+        openapi_tags=OPENAPI_TAGS,
+        docs_url="/docs" if docs_enabled else None,
+        redoc_url="/redoc" if docs_enabled else None,
+        openapi_url="/openapi.json" if docs_enabled else None,
     )
 
     cors_origins = _unique_origins(
@@ -101,9 +153,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "If-None-Match",
             "If-Range",
             "Range",
+            "X-Request-ID",
         ],
         expose_headers=[
             "X-Supporters-Source",
+            "X-Request-ID",
             "Warning",
             "ETag",
             "X-Audio-Version",
@@ -124,6 +178,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         RequestBodyLimitMiddleware,
         max_bytes=runtime_settings.max_request_body_bytes,
     )
+    app.add_middleware(HTTPSRequiredMiddleware, settings=runtime_settings)
+    app.add_middleware(SecurityHeadersMiddleware, settings=runtime_settings)
+    app.add_middleware(RequestContextMiddleware, settings=runtime_settings)
 
     started_at = time.monotonic()
 
@@ -146,12 +203,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "ok": True,
             "service": runtime_settings.app_name,
             "version": APP_VERSION,
-            "environment": runtime_settings.app_environment,
-            "serverTime": datetime.now(timezone.utc).isoformat(),
+            "serverTime": datetime.now(UTC).isoformat(),
             "uptimeSeconds": round(time.monotonic() - started_at, 3),
-            "supabaseConfigured": runtime_settings.supabase_enabled,
-            "telegramConfigured": runtime_settings.telegram_enabled,
-            "visitEncryptionConfigured": app.state.visit_crypto.enabled,
             "audioRouteConfigured": True,
             "audioTelegramWebhookRouteConfigured": True,
             "audioTelegramWebhookConfigured": bool(
@@ -185,6 +238,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # production health output safe while preserving full diagnostics in
         # development and test environments.
         if not runtime_settings.is_production:
+            payload["environment"] = runtime_settings.app_environment
+            payload["supabaseConfigured"] = runtime_settings.supabase_enabled
+            payload["telegramConfigured"] = runtime_settings.telegram_enabled
+            payload["visitEncryptionConfigured"] = app.state.visit_crypto.enabled
             payload["audioTelegramWebhookURL"] = getattr(
                 app.state, "audio_telegram_webhook_url", None
             )
@@ -208,17 +265,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         response.headers["Cache-Control"] = "no-store, max-age=0"
         response.headers["X-Robots-Tag"] = "noindex, nofollow"
 
-    @app.get("/", tags=["system"], include_in_schema=False)
-    async def root(response: Response) -> dict[str, object]:
+    @app.get(
+        "/",
+        tags=["system"],
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def root(
+        request: Request,
+        response: Response,
+    ) -> dict[str, object] | Response:
+        if "text/html" in request.headers.get("accept", "").lower():
+            return build_landing_page(
+                service_name=runtime_settings.app_name,
+                version=APP_VERSION,
+                api_prefix=runtime_settings.api_prefix,
+                docs_enabled=docs_enabled,
+            )
+
         set_health_headers(response)
-        return {
+        payload: dict[str, object] = {
             "ok": True,
+            "status": "operational",
             "service": runtime_settings.app_name,
+            "version": APP_VERSION,
             "health": "/health",
             "audioMetadata": f"{runtime_settings.api_prefix}/audio/metadata",
             "telegramWebhook": f"{runtime_settings.api_prefix}/telegram/webhook",
-            "docs": "/docs",
         }
+        if docs_enabled:
+            payload["docs"] = "/docs"
+        return payload
 
     @app.get("/health", tags=["system"], include_in_schema=True)
     async def health(response: Response) -> dict[str, object]:

@@ -11,7 +11,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi.testclient import TestClient
 
 from app.config import Settings
-from app.main import create_app
+from app.main import APP_VERSION, create_app
+from app.services.rate_limit import TokenBucketRateLimiter
 from app.services.telegram import TelegramResult
 from app.services.visit_crypto import AAD, ENCRYPTION_NAME, VisitCryptoService
 
@@ -58,6 +59,9 @@ class FakeSupabase:
         self.visit_ids.add(row["dedupe_key"])
         return {"id": str(uuid4())}
 
+    async def find_recent_visit(self, **kwargs):
+        return None
+
     async def update_visit_delivery(self, *args, **kwargs):
         return None
 
@@ -83,9 +87,13 @@ def make_private_key_b64() -> str:
 
 
 def build_client(supabase=None) -> TestClient:
+    admin_key = "test-admin-key-that-is-long-enough-123456"
     settings = Settings(
         app_environment="test",
-        supporters_admin_key="test-admin-key",
+        supabase_url="https://test.supabase.co",
+        supabase_secret_key="test-server-secret",
+        supporters_admin_api_enabled=True,
+        supporters_admin_key=admin_key,
         visit_hash_salt="test-hash-salt",
         visit_private_key_b64=make_private_key_b64(),
         require_encrypted_visits=True,
@@ -97,6 +105,7 @@ def build_client(supabase=None) -> TestClient:
     app.state.supabase = supabase or FakeSupabase()
     app.state.telegram = FakeTelegram()
     app.state.visit_crypto = VisitCryptoService(settings)
+    app.state.admin_rate_limiter = TokenBucketRateLimiter()
     from app.services.visits import VisitService
 
     app.state.visits = VisitService(settings, app.state.supabase, app.state.telegram)
@@ -129,7 +138,7 @@ def test_health() -> None:
         response = client.get("/health")
         assert response.status_code == 200
         assert response.json()["ok"] is True
-        assert response.json()["version"] == "1.1.0"
+        assert response.json()["version"] == APP_VERSION
 
 
 def test_api_health_alias() -> None:
@@ -220,7 +229,7 @@ def test_create_supporter() -> None:
     with build_client() as client:
         response = client.post(
             "/api/supporters",
-            headers={"X-Admin-Key": "test-admin-key"},
+            headers={"X-Admin-Key": "test-admin-key-that-is-long-enough-123456"},
             json={"name": "Dara", "amount": 10, "currency": "usd"},
         )
         assert response.status_code == 201
