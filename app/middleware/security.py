@@ -4,17 +4,105 @@ import logging
 import re
 import secrets
 import time
+from collections.abc import Sequence
 
-from starlette.datastructures import MutableHeaders
-from starlette.responses import JSONResponse
+from starlette.datastructures import URL, Headers, MutableHeaders
+from starlette.middleware.cors import CORSMiddleware
+from starlette.responses import RedirectResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.config import Settings
+from app.problems import problem_response
 from app.utils.network import request_is_https_scope
 
 logger = logging.getLogger("app.request")
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{8,64}$")
-_HEALTH_PATHS = frozenset({"/health"})
+_HEALTH_PATHS = frozenset({"/health", "/health/live", "/health/ready"})
+
+
+class ProblemCORSMiddleware(CORSMiddleware):
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = Headers(scope=scope)
+        origin = headers.get("origin")
+        if origin is None:
+            await self.app(scope, receive, send)
+            return
+
+        if scope["method"] == "OPTIONS" and "access-control-request-method" in headers:
+            response = self.preflight_response(request_headers=headers)
+            if response.status_code >= 400:
+                response_headers = {
+                    key: value
+                    for key, value in response.headers.items()
+                    if key.lower() not in {"content-length", "content-type"}
+                }
+                response = problem_response(
+                    scope,
+                    status_code=400,
+                    detail="The CORS preflight request is not allowed.",
+                    error_code="cors_preflight_rejected",
+                    headers=response_headers,
+                )
+            await response(scope, receive, send)
+            return
+
+        await self.simple_response(scope, receive, send, request_headers=headers)
+
+
+class ProblemTrustedHostMiddleware:
+    def __init__(
+        self,
+        app: ASGIApp,
+        allowed_hosts: Sequence[str] | None = None,
+        www_redirect: bool = True,
+    ) -> None:
+        values = list(allowed_hosts or ["*"])
+        for pattern in values:
+            if "*" in pattern[1:] or (
+                pattern.startswith("*")
+                and pattern != "*"
+                and not pattern.startswith("*.")
+            ):
+                raise ValueError("Allowed host wildcards must use the '*.example.com' form.")
+        self.app = app
+        self.allowed_hosts = values
+        self.allow_any = "*" in values
+        self.www_redirect = www_redirect
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if self.allow_any or scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = Headers(scope=scope)
+        host = headers.get("host", "").split(":")[0]
+        is_valid = False
+        found_www_redirect = False
+        for pattern in self.allowed_hosts:
+            if host == pattern or (pattern.startswith("*") and host.endswith(pattern[1:])):
+                is_valid = True
+                break
+            if f"www.{host}" == pattern:
+                found_www_redirect = True
+
+        if is_valid:
+            await self.app(scope, receive, send)
+            return
+        if found_www_redirect and self.www_redirect:
+            url = URL(scope=scope)
+            response = RedirectResponse(url=str(url.replace(netloc=f"www.{url.netloc}")))
+        else:
+            response = problem_response(
+                scope,
+                status_code=400,
+                detail="The request Host header is not allowed.",
+                error_code="invalid_host",
+            )
+        await response(scope, receive, send)
 
 
 def _header_value(scope: Scope, name: bytes) -> str:
@@ -83,15 +171,21 @@ class HTTPSRequiredMiddleware:
             return
 
         path = str(scope.get("path", ""))
-        health_paths = _HEALTH_PATHS | {f"{self.settings.api_prefix}/health"}
+        health_paths = _HEALTH_PATHS | {
+            f"{self.settings.api_prefix}/health",
+            f"{self.settings.api_prefix}/v1/health",
+            f"{self.settings.api_prefix}/v1/health/live",
+            f"{self.settings.api_prefix}/v1/health/ready",
+        }
         if path in health_paths or request_is_https_scope(scope, self.settings):
             await self.app(scope, receive, send)
             return
 
-        response = JSONResponse(
+        response = problem_response(
+            scope,
             status_code=400,
-            content={"detail": "HTTPS is required."},
-            headers={"Cache-Control": "no-store"},
+            detail="HTTPS is required.",
+            error_code="https_required",
         )
         await response(scope, receive, send)
 
@@ -125,7 +219,10 @@ class SecurityHeadersMiddleware:
                     headers["X-Robots-Tag"] = "noindex, nofollow"
 
                 path = str(scope.get("path", ""))
-                docs_path = path.startswith(("/docs", "/redoc", "/openapi.json"))
+                docs_path = (
+                    path in {"/docs", "/redoc", "/openapi.json"}
+                    or path.startswith(("/docs/", "/redoc/"))
+                )
                 if not docs_path and "Content-Security-Policy" not in headers:
                     headers["Content-Security-Policy"] = (
                         "default-src 'none'; frame-ancestors 'none'; "

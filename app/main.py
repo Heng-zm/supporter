@@ -7,8 +7,8 @@ from datetime import UTC, datetime
 
 import httpx
 from fastapi import FastAPI, Request, Response
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.audio_extension import (
     close_audio_extension,
@@ -23,8 +23,16 @@ from app.landing import build_landing_page
 from app.middleware.body_limit import RequestBodyLimitMiddleware
 from app.middleware.security import (
     HTTPSRequiredMiddleware,
+    ProblemCORSMiddleware,
+    ProblemTrustedHostMiddleware,
     RequestContextMiddleware,
     SecurityHeadersMiddleware,
+)
+from app.problems import (
+    PROBLEM_RESPONSES,
+    http_exception_handler,
+    unhandled_exception_handler,
+    validation_exception_handler,
 )
 from app.routers import supporters, visits
 from app.services.rate_limit import TokenBucketRateLimiter
@@ -34,7 +42,8 @@ from app.services.telegram_commands import TelegramCommandService
 from app.services.visit_crypto import VisitCryptoService
 from app.services.visits import VisitService
 
-APP_VERSION = "2.4.2-audio"
+APP_VERSION = "2.5.0-audio"
+API_VERSION = "v1"
 logger = logging.getLogger("app.startup")
 
 OPENAPI_TAGS = [
@@ -78,6 +87,7 @@ def _unique_origins(*origin_groups: list[str] | tuple[str, ...]) -> list[str]:
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     runtime_settings = settings or get_settings()
+    versioned_prefix = f"{runtime_settings.api_prefix}/{API_VERSION}"
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -156,7 +166,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         docs_url="/docs" if docs_enabled else None,
         redoc_url="/redoc" if docs_enabled else None,
         openapi_url="/openapi.json" if docs_enabled else None,
+        responses=PROBLEM_RESPONSES,
     )
+    app.add_exception_handler(StarletteHTTPException, http_exception_handler)
+    app.add_exception_handler(RequestValidationError, validation_exception_handler)
+    app.add_exception_handler(Exception, unhandled_exception_handler)
 
     cors_origins = _unique_origins(
         runtime_settings.backend_cors_origins,
@@ -164,7 +178,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
 
     app.add_middleware(
-        CORSMiddleware,
+        ProblemCORSMiddleware,
         allow_origins=cors_origins,
         allow_credentials=False,
         allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
@@ -193,7 +207,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     if runtime_settings.allowed_hosts != ["*"]:
         app.add_middleware(
-            TrustedHostMiddleware,
+            ProblemTrustedHostMiddleware,
             allowed_hosts=runtime_settings.allowed_hosts,
         )
 
@@ -306,6 +320,87 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         return payload
 
+    def readiness_payload() -> tuple[bool, dict[str, object]]:
+        supabase = getattr(app.state, "supabase", None)
+        visit_crypto = getattr(app.state, "visit_crypto", None)
+        audio_store = getattr(app.state, "audio_store", None)
+        audio_settings = getattr(app.state, "audio_settings", None)
+        audio_webhook_settings = getattr(
+            app.state,
+            "audio_telegram_webhook_settings",
+            None,
+        )
+
+        audio_enabled = bool(getattr(audio_settings, "enabled", False))
+        audio_requires_supabase = bool(
+            audio_enabled
+            and getattr(audio_settings, "resolved_storage_mode", None) == "supabase"
+        )
+        supabase_required = bool(
+            runtime_settings.is_production
+            or runtime_settings.supporters_admin_api_enabled
+            or runtime_settings.require_visit_storage
+            or runtime_settings.telegram_commands_enabled
+            or audio_requires_supabase
+        )
+        supabase_ok = bool(getattr(supabase, "enabled", False))
+
+        encryption_required = runtime_settings.require_encrypted_visits
+        encryption_ok = bool(getattr(visit_crypto, "enabled", False))
+
+        audio_configuration_ok = bool(
+            audio_settings is not None
+            and not getattr(audio_settings, "configuration_error", "")
+        )
+        audio_storage_ok = bool(
+            audio_store is not None
+            and getattr(audio_store, "storage_ready", False)
+            and audio_configuration_ok
+        )
+
+        telegram_required = bool(
+            runtime_settings.telegram_commands_enabled
+            or (runtime_settings.is_production and runtime_settings.visit_alert_enabled)
+        )
+        if runtime_settings.telegram_commands_enabled:
+            telegram_ok = runtime_settings.telegram_commands_configured
+        elif telegram_required:
+            telegram_ok = runtime_settings.telegram_visit_alert_enabled
+        else:
+            telegram_ok = True
+        telegram_webhook_required = bool(
+            getattr(audio_webhook_settings, "auto_configure", False)
+        )
+        telegram_webhook_ok = bool(
+            not telegram_webhook_required
+            or getattr(app.state, "audio_telegram_webhook_configured", False)
+        )
+
+        checks: dict[str, dict[str, bool]] = {
+            "supabase": {"ok": supabase_ok, "required": supabase_required},
+            "visitEncryption": {
+                "ok": encryption_ok,
+                "required": encryption_required,
+            },
+            "audioStorage": {"ok": audio_storage_ok, "required": audio_enabled},
+            "telegram": {"ok": telegram_ok, "required": telegram_required},
+            "telegramWebhook": {
+                "ok": telegram_webhook_ok,
+                "required": telegram_webhook_required,
+            },
+        }
+        ready = all(
+            not check["required"] or check["ok"]
+            for check in checks.values()
+        )
+        return ready, {
+            "ok": ready,
+            "status": "ready" if ready else "not_ready",
+            "service": runtime_settings.app_name,
+            "version": APP_VERSION,
+            "checks": checks,
+        }
+
     def set_health_headers(response: Response) -> None:
         response.headers["Cache-Control"] = "no-store, max-age=0"
         response.headers["X-Robots-Tag"] = "noindex, nofollow"
@@ -324,7 +419,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return build_landing_page(
                 service_name=runtime_settings.app_name,
                 version=APP_VERSION,
-                api_prefix=runtime_settings.api_prefix,
+                api_prefix=versioned_prefix,
                 docs_enabled=docs_enabled,
             )
 
@@ -334,8 +429,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "status": "operational",
             "service": runtime_settings.app_name,
             "version": APP_VERSION,
-            "health": "/health",
-            "audioMetadata": f"{runtime_settings.api_prefix}/audio/metadata",
+            "health": "/health/ready",
+            "apiVersion": API_VERSION,
+            "apiBase": f"{runtime_settings.api_prefix}/{API_VERSION}",
+            "audioMetadata": (
+                f"{runtime_settings.api_prefix}/{API_VERSION}/audio/metadata"
+            ),
             "telegramWebhook": f"{runtime_settings.api_prefix}/telegram/webhook",
         }
         if docs_enabled:
@@ -352,12 +451,58 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         set_health_headers(response)
         return health_payload()
 
-    app.include_router(supporters.router, prefix=runtime_settings.api_prefix)
-    app.include_router(visits.router, prefix=runtime_settings.api_prefix)
+    @app.get("/health/live", tags=["system"])
+    async def health_live(response: Response) -> dict[str, object]:
+        set_health_headers(response)
+        return {
+            "ok": True,
+            "status": "alive",
+            "service": runtime_settings.app_name,
+            "version": APP_VERSION,
+            "uptimeSeconds": round(time.monotonic() - started_at, 3),
+        }
+
+    @app.get("/health/ready", tags=["system"])
+    async def health_ready(response: Response) -> dict[str, object]:
+        set_health_headers(response)
+        ready, payload = readiness_payload()
+        response.status_code = 200 if ready else 503
+        return payload
+
+    @app.get(f"{versioned_prefix}/health", tags=["system"])
+    async def versioned_health(response: Response) -> dict[str, object]:
+        set_health_headers(response)
+        return health_payload()
+
+    @app.get(f"{versioned_prefix}/health/live", tags=["system"])
+    async def versioned_health_live(response: Response) -> dict[str, object]:
+        return await health_live(response)
+
+    @app.get(f"{versioned_prefix}/health/ready", tags=["system"])
+    async def versioned_health_ready(response: Response) -> dict[str, object]:
+        return await health_ready(response)
+
+    app.include_router(
+        supporters.router,
+        prefix=runtime_settings.api_prefix,
+        include_in_schema=False,
+    )
+    app.include_router(
+        visits.router,
+        prefix=runtime_settings.api_prefix,
+        include_in_schema=False,
+    )
+    app.include_router(supporters.router, prefix=versioned_prefix)
+    app.include_router(visits.router, prefix=versioned_prefix)
 
     # This call was missing from the deployed backend. Without it FastAPI
     # correctly returns 404 for /api/audio/metadata.
-    include_audio_router(app, api_prefix=runtime_settings.api_prefix)
+    include_audio_router(
+        app,
+        api_prefix=runtime_settings.api_prefix,
+        include_in_schema=False,
+    )
+    include_audio_router(app, api_prefix=versioned_prefix)
     include_audio_telegram_webhook_router(
         app,
         api_prefix=runtime_settings.api_prefix,

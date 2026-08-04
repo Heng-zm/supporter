@@ -9,6 +9,7 @@ import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import APIRouter, FastAPI, HTTPException, Request, status
@@ -17,6 +18,7 @@ from pydantic import ValidationError
 
 from app.config import Settings
 from app.models import TelegramUpdate
+from app.problems import problem_response
 from app.utils.network import client_ip
 from app.utils.security import ip_is_trusted, sha256_text
 
@@ -92,8 +94,20 @@ class AudioTelegramWebhookSettings:
             return (
                 "TELEGRAM_WEBHOOK_URL or RENDER_EXTERNAL_URL is not configured."
             )
-        if not self.webhook_url.startswith("https://"):
-            return "TELEGRAM_WEBHOOK_URL must start with https://."
+        try:
+            parsed = urlsplit(self.webhook_url)
+            _ = parsed.port
+        except ValueError:
+            return "TELEGRAM_WEBHOOK_URL is invalid."
+        if parsed.scheme.lower() != "https" or not parsed.hostname:
+            return "TELEGRAM_WEBHOOK_URL must be a valid HTTPS URL."
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            return (
+                "TELEGRAM_WEBHOOK_URL must not contain credentials, a query, "
+                "or a fragment."
+            )
+        if not parsed.path.rstrip("/").endswith("/telegram/webhook"):
+            return "TELEGRAM_WEBHOOK_URL must end with /telegram/webhook."
         return ""
 
 
@@ -260,8 +274,10 @@ async def audio_telegram_webhook(request: Request) -> JSONResponse:
                     },
                 )
 
-    content_type = request.headers.get("content-type", "").lower()
-    if "application/json" not in content_type:
+    content_type = (
+        request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    )
+    if content_type != "application/json":
         raise HTTPException(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
             detail="Telegram webhook requires application/json.",
@@ -270,7 +286,10 @@ async def audio_telegram_webhook(request: Request) -> JSONResponse:
     content_length = request.headers.get("content-length", "").strip()
     if content_length:
         try:
-            if int(content_length) > _MAX_UPDATE_BYTES:
+            parsed_content_length = int(content_length)
+            if parsed_content_length < 0:
+                raise ValueError
+            if parsed_content_length > _MAX_UPDATE_BYTES:
                 raise HTTPException(
                     status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                     detail="Telegram update is too large.",
@@ -310,9 +329,12 @@ async def audio_telegram_webhook(request: Request) -> JSONResponse:
     if claim == "completed":
         return JSONResponse({"ok": True, "handled": True, "duplicate": True})
     if claim == "processing":
-        response = JSONResponse(
-            {"ok": False, "retry": True, "reason": "already_processing"},
+        response = problem_response(
+            request.scope,
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The Telegram update is already being processed.",
+            error_code="telegram_update_already_processing",
+            extensions={"retry": True, "reason": "already_processing"},
         )
         response.headers["Retry-After"] = "2"
         return response
@@ -336,9 +358,12 @@ async def audio_telegram_webhook(request: Request) -> JSONResponse:
     except Exception:
         await _release_update(request.app, update_id)
         logger.exception("Telegram /audio update processing failed update_id=%s", update_id)
-        response = JSONResponse(
-            {"ok": False, "retry": True, "reason": "processing_failed"},
+        response = problem_response(
+            request.scope,
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Telegram update processing failed temporarily.",
+            error_code="telegram_update_processing_failed",
+            extensions={"retry": True, "reason": "processing_failed"},
         )
         response.headers["Retry-After"] = "2"
         return response

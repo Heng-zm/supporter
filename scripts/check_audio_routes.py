@@ -10,6 +10,8 @@ if str(PROJECT_ROOT) not in sys.path:
 EXPECTED_ROUTES = {
     "/api/audio/metadata",
     "/api/audio/file",
+    "/api/v1/audio/metadata",
+    "/api/v1/audio/file",
     "/api/telegram/webhook",
 }
 
@@ -31,7 +33,8 @@ def _patch_source_check() -> tuple[bool, list[str]]:
     main_path = PROJECT_ROOT / "app" / "main.py"
     source = main_path.read_text(encoding="utf-8")
     required = [
-        "include_audio_router(app, api_prefix=runtime_settings.api_prefix)",
+        "include_audio_router(",
+        "api_prefix=versioned_prefix",
         "include_audio_telegram_webhook_router(",
         "await start_audio_extension(app)",
         "await configure_audio_telegram_webhook(",

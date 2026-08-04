@@ -29,7 +29,10 @@ _CAMPAIGN_QUERY_FIELDS = {
 
 
 def _sanitize_url(value: str, *, keep_query: bool) -> str:
-    text = str(value or "").strip()[:1500]
+    raw = str(value or "")
+    if any(ord(character) < 32 or ord(character) == 127 for character in raw):
+        return ""
+    text = raw.strip()[:1500]
     if not text or text == "Direct visit":
         return text
     try:
@@ -188,9 +191,17 @@ class VisitService:
     def _location(self, request: Request) -> tuple[str, str | None, str | None, str | None]:
         if not self._proxy_is_trusted(request):
             return "Unknown", None, None, None
-        country = request.headers.get("x-vercel-ip-country") or request.headers.get("cf-ipcountry")
-        region = request.headers.get("x-vercel-ip-country-region")
-        city = request.headers.get("x-vercel-ip-city")
+        country = _clean_field(
+            request.headers.get("x-vercel-ip-country")
+            or request.headers.get("cf-ipcountry")
+            or "",
+            80,
+        ) or None
+        region = _clean_field(
+            request.headers.get("x-vercel-ip-country-region", ""),
+            160,
+        ) or None
+        city = _clean_field(request.headers.get("x-vercel-ip-city", ""), 160) or None
         value = ", ".join(part for part in (city, region, country) if part) or "Unknown"
         return value, country, region, city
 

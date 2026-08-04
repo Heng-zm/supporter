@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+from app.problems import problem_response
 
 
 class RequestBodyTooLarge(Exception):
@@ -58,9 +59,10 @@ class RequestBodyLimitMiddleware:
 
     @staticmethod
     async def _reject(scope: Scope, receive: Receive, send: Send) -> None:
-        response = JSONResponse(
+        response = problem_response(
+            scope,
             status_code=413,
-            content={"detail": "Request body is too large."},
-            headers={"Cache-Control": "no-store"},
+            detail="Request body is too large.",
+            error_code="payload_too_large",
         )
         await response(scope, receive, send)

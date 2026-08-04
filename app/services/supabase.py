@@ -9,12 +9,16 @@ from urllib.parse import quote
 import httpx
 
 from app.config import Settings
+from app.services.supporter_cursor import SupporterCursor
 
 PUBLIC_SUPPORTER_COLUMNS = (
     "id,name,amount,currency,message,avatar_url,payment_method,created_at"
 )
 ADMIN_SUPPORTER_COLUMNS = f"{PUBLIC_SUPPORTER_COLUMNS},is_visible"
-TRANSIENT_STATUS_CODES = {429, 502, 503, 504}
+# Supabase/PostgREST can briefly return a gateway error or a direct 5xx while
+# a project is waking up or its schema cache is reloading. Read requests and
+# explicitly idempotent writes are safe to retry in those cases.
+TRANSIENT_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 logger = logging.getLogger("app.supabase")
 
 
@@ -203,7 +207,7 @@ class SupabaseService:
             params={
                 "select": PUBLIC_SUPPORTER_COLUMNS,
                 "is_visible": "eq.true",
-                "order": "amount.desc,created_at.desc",
+                "order": "amount.desc,created_at.desc,id.desc",
                 "limit": str(limit),
             },
         )
@@ -290,6 +294,31 @@ class SupabaseService:
                 raise
 
             return rows, "supabase", False
+
+    async def list_supporters_page(
+        self,
+        limit: int,
+        cursor: SupporterCursor,
+    ) -> list[dict[str, Any]]:
+        amount = cursor.amount_text
+        created_at = cursor.created_at_text
+        supporter_id = str(cursor.supporter_id)
+        rows = await self._request(
+            "GET",
+            "supporters",
+            params={
+                "select": PUBLIC_SUPPORTER_COLUMNS,
+                "is_visible": "eq.true",
+                "order": "amount.desc,created_at.desc,id.desc",
+                "limit": str(limit),
+                "or": (
+                    f"(amount.lt.{amount},"
+                    f"and(amount.eq.{amount},created_at.lt.{created_at}),"
+                    f"and(amount.eq.{amount},created_at.eq.{created_at},id.lt.{supporter_id}))"
+                ),
+            },
+        )
+        return rows if isinstance(rows, list) else []
 
     async def list_supporters_admin(
         self,

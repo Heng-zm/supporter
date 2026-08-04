@@ -19,8 +19,13 @@ def test_health_and_routes() -> None:
         assert response.json()["ok"] is True
         paths = {route.path for route in app.routes}
         assert "/api/supporters" in paths
+        assert "/api/v1/supporters" in paths
         assert "/api/website/visit" in paths
+        assert "/api/v1/website/visit" in paths
+        assert "/api/v1/audio/metadata" in paths
         assert "/api/telegram/webhook" in paths
+        assert "/health/live" in paths
+        assert "/health/ready" in paths
 
 
 def test_root_supports_browser_and_api_clients() -> None:
@@ -58,6 +63,55 @@ def test_body_limit_rejects_large_payload() -> None:
             headers={"Content-Type": "application/json"},
         )
         assert response.status_code == 413
+        assert response.headers["content-type"].startswith("application/problem+json")
+        assert response.json()["errorCode"] == "payload_too_large"
+
+
+def test_render_blueprint_uses_readiness_health_check() -> None:
+    from pathlib import Path
+
+    source = (Path(__file__).parents[1] / "render.yaml").read_text(encoding="utf-8")
+    assert "runtime: docker" in source
+    assert "plan: free" in source
+    assert "healthCheckPath: /health/ready" in source
+
+
+def test_openapi_documents_v1_and_problem_details_only() -> None:
+    settings = Settings(
+        require_encrypted_visits=False,
+        trust_proxy_headers=False,
+        enable_api_docs=True,
+    )
+    app = create_app(settings)
+    with TestClient(app) as client:
+        schema = client.get("/openapi.json").json()
+
+    paths = schema["paths"]
+    assert "/api/v1/supporters" in paths
+    assert "/api/v1/audio/metadata" in paths
+    assert "/api/supporters" not in paths
+    assert "/api/audio/metadata" not in paths
+    error_content = paths["/api/v1/supporters"]["get"]["responses"]["422"][
+        "content"
+    ]
+    assert set(error_content) == {"application/problem+json"}
+
+
+def test_unhandled_errors_are_safe_problem_details() -> None:
+    settings = Settings(require_encrypted_visits=False, trust_proxy_headers=False)
+    app = create_app(settings)
+
+    @app.get("/test-unhandled", include_in_schema=False)
+    async def test_unhandled() -> None:
+        raise RuntimeError("sensitive internal detail")
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get("/test-unhandled")
+
+    assert response.status_code == 500
+    assert response.headers["content-type"].startswith("application/problem+json")
+    assert response.json()["errorCode"] == "internal_server_error"
+    assert "sensitive internal detail" not in response.text
 
 
 def test_production_rejects_malformed_required_encryption_key() -> None:

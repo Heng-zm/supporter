@@ -21,7 +21,13 @@ from app.models import (
     SupportersResponse,
     SupporterUpdate,
 )
+from app.problems import problem_detail
 from app.services.supabase import SupabaseError, SupabaseService
+from app.services.supporter_cursor import (
+    decode_supporter_cursor,
+    encode_supporter_cursor,
+    supporter_cursor_from_row,
+)
 
 logger = logging.getLogger("app.supporters")
 router = APIRouter(prefix="/supporters", tags=["supporters"])
@@ -53,10 +59,25 @@ def _set_public_headers(response: Response, source: str, stale: bool) -> None:
 async def list_supporters(
     response: Response,
     limit: Annotated[int | None, Query(ge=1, le=500)] = None,
+    cursor: Annotated[str | None, Query(min_length=20, max_length=1024)] = None,
     settings: Settings = Depends(get_app_settings),
     supabase: SupabaseService = Depends(get_supabase),
 ) -> SupportersResponse:
     requested_limit = min(limit or settings.max_supporters, settings.max_supporters)
+    fetch_limit = requested_limit + 1
+
+    decoded_cursor = None
+    if cursor:
+        try:
+            decoded_cursor = decode_supporter_cursor(cursor, settings.visit_hash_salt)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=problem_detail(
+                    "The supporter cursor is invalid or has expired.",
+                    "invalid_supporter_cursor",
+                ),
+            ) from exc
 
     if not supabase.enabled:
         source = "not-configured"
@@ -64,12 +85,34 @@ async def list_supporters(
         return SupportersResponse(supporters=[], source=source)
 
     try:
-        rows, source, stale = await supabase.list_supporters_resilient(requested_limit)
+        if decoded_cursor is None:
+            rows, source, stale = await supabase.list_supporters_resilient(fetch_limit)
+        else:
+            rows = await supabase.list_supporters_page(fetch_limit, decoded_cursor)
+            source, stale = "supabase", False
     except SupabaseError as exc:
         raise _provider_error() from exc
 
+    has_more = len(rows) > requested_limit
+    page = rows[:requested_limit]
+    next_cursor = None
+    if has_more and page:
+        try:
+            next_cursor = encode_supporter_cursor(
+                supporter_cursor_from_row(page[-1]),
+                settings.visit_hash_salt,
+            )
+        except ValueError as exc:
+            raise _provider_error() from exc
+
     _set_public_headers(response, source, stale)
-    return SupportersResponse(supporters=rows, source=source, stale=stale)
+    return SupportersResponse(
+        supporters=page,
+        source=source,
+        stale=stale,
+        hasMore=has_more,
+        nextCursor=next_cursor,
+    )
 
 
 @router.post(

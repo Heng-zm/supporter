@@ -27,7 +27,7 @@ drop index if exists public.supporters_telegram_update_id_idx;
 create unique index supporters_telegram_update_id_idx
     on public.supporters (telegram_update_id);
 create index if not exists supporters_public_order_idx
-    on public.supporters (is_visible, amount desc, created_at desc);
+    on public.supporters (is_visible, amount desc, created_at desc, id desc);
 
 create table if not exists public.visit_events (
     id uuid primary key default gen_random_uuid(),

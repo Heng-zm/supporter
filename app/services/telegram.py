@@ -32,6 +32,17 @@ class TelegramService:
         return escape(text[:maximum], quote=True)
 
     @staticmethod
+    def _fit_html_message(message: str, maximum: int = 3900) -> str:
+        """Truncate only at a line boundary so HTML tags/entities stay valid."""
+        if len(message) <= maximum:
+            return message
+        candidate = message[: maximum - 2]
+        line_break = candidate.rfind("\n")
+        if line_break > 0:
+            candidate = candidate[:line_break]
+        return f"{candidate}\n…"
+
+    @staticmethod
     def _retry_delay(response: httpx.Response, attempt: int) -> float:
         retry_after = response.headers.get("retry-after", "").strip()
         try:
@@ -226,7 +237,7 @@ class TelegramService:
             ]
         )
         message = "\n".join(lines)
-        return message if len(message) <= 3900 else f"{message[:3899]}…"
+        return self._fit_html_message(message)
 
     async def send_message(
         self,

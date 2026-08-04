@@ -1,0 +1,45 @@
+name: Keep Render service warm
+
+on:
+  schedule:
+    # Render Free spins down after 15 idle minutes. Use an offset from the top
+    # of the hour because GitHub's scheduled workload is busiest at :00.
+    - cron: "3,13,23,33,43,53 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: render-keepalive
+  cancel-in-progress: true
+
+jobs:
+  ping-health:
+    if: ${{ vars.RENDER_SERVICE_URL != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Request the public health endpoint
+        shell: bash
+        env:
+          RENDER_SERVICE_URL: ${{ vars.RENDER_SERVICE_URL }}
+        run: |
+          set -euo pipefail
+
+          base_url="${RENDER_SERVICE_URL%/}"
+          if [[ "$base_url" != https://* ]]; then
+            echo "RENDER_SERVICE_URL must be a public https:// URL." >&2
+            exit 1
+          fi
+
+          curl \
+            --fail-with-body \
+            --silent \
+            --show-error \
+            --connect-timeout 15 \
+            --max-time 75 \
+            --retry 1 \
+            --retry-all-errors \
+            --retry-delay 5 \
+            --retry-max-time 150 \
+            "${base_url}/health/live" >/dev/null

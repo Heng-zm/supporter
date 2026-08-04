@@ -135,6 +135,32 @@ async def test_send_message_includes_inline_keyboard() -> None:
     assert result.ok is True
     assert payloads[0]["reply_markup"] == keyboard
 
+
+def test_long_visit_message_is_truncated_at_safe_html_boundary() -> None:
+    settings = Settings(require_encrypted_visits=False)
+    service = TelegramService(settings, httpx.AsyncClient())
+    try:
+        message = service.build_visit_message(
+            {
+                "url": "https://example.com/" + "<unsafe>" * 200,
+                "referrer": "https://referrer.example/" + "&value" * 250,
+                "title": "T" * 300,
+                "device": "D" * 120,
+                "browser": "B" * 160,
+                "platform": "P" * 160,
+            }
+        )
+    finally:
+        import asyncio
+
+        asyncio.run(service.client.aclose())
+
+    assert len(message) <= 3900
+    assert message.endswith("\n…")
+    assert message.count("<b>") == message.count("</b>")
+    assert not message.endswith(("&", "&a", "&am", "&amp"))
+
+
 async def test_network_error_does_not_leak_bot_token() -> None:
     token = "123456:abcdefghijklmnopqrstuvwxyzABCDE"
 

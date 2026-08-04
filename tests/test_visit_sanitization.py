@@ -68,6 +68,31 @@ async def test_visit_urls_drop_queries_fragments_and_client_timestamp() -> None:
     assert row["url"] == "https://example.com/pay"
 
 
+async def test_visit_urls_reject_embedded_control_characters() -> None:
+    settings = Settings(
+        require_encrypted_visits=False,
+        trust_proxy_headers=False,
+    )
+    async with httpx.AsyncClient() as client:
+        service = VisitService(
+            settings,
+            SupabaseService(settings, client),
+            TelegramService(settings, client),
+        )
+        public_visit, row, _, _ = service.build(
+            _request(),
+            VisitPayload(
+                url="https://example.com/pay\nforged",
+                referrer="https://referrer.example/\tforged",
+            ),
+        )
+
+    assert public_visit["url"] == ""
+    assert public_visit["referrer"] == "Direct visit"
+    assert row["url"] is None
+    assert row["referrer"] is None
+
+
 async def test_detailed_analytics_are_bounded_hashed_and_alert_ready() -> None:
     settings = Settings(
         require_encrypted_visits=False,

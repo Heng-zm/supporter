@@ -17,7 +17,7 @@ create table if not exists public.supporters (
 );
 
 create index if not exists supporters_public_ranking_idx
-  on public.supporters (is_visible, amount desc, created_at desc);
+  on public.supporters (is_visible, amount desc, created_at desc, id desc);
 
 create table if not exists public.visit_events (
   id uuid primary key default gen_random_uuid(),

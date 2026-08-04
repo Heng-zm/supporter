@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from decimal import Decimal
+from uuid import UUID
+
 import httpx
 import pytest
 
 from app.config import Settings
 from app.services.supabase import SupabaseError, SupabaseService
+from app.services.supporter_cursor import SupporterCursor
 from app.services.telegram_commands import _database_error_message
 
 
@@ -71,6 +76,49 @@ async def test_supabase_error_preserves_postgrest_code() -> None:
     assert "unique" in (caught.value.detail or "")
 
 
+async def test_safe_supabase_request_retries_direct_500(monkeypatch) -> None:
+    calls = 0
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(500, json={"message": "temporary failure"})
+        return httpx.Response(200, json=[])
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr("app.services.supabase.asyncio.sleep", no_sleep)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        service = SupabaseService(_settings(), client)
+        rows = await service.list_supporters(10)
+
+    assert rows == []
+    assert calls == 2
+
+
+async def test_supporter_cursor_page_uses_stable_keyset_filter() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["order"] == "amount.desc,created_at.desc,id.desc"
+        keyset_filter = request.url.params["or"]
+        assert "amount.lt.20.00" in keyset_filter
+        assert "created_at.lt.2026-07-25T02:00:00Z" in keyset_filter
+        assert "id.lt.00000000-0000-0000-0000-000000000002" in keyset_filter
+        return httpx.Response(200, json=[])
+
+    cursor = SupporterCursor(
+        amount=Decimal("20.00"),
+        created_at=datetime(2026, 7, 25, 2, tzinfo=UTC),
+        supporter_id=UUID("00000000-0000-0000-0000-000000000002"),
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        service = SupabaseService(_settings(), client)
+        rows = await service.list_supporters_page(11, cursor)
+
+    assert rows == []
+
+
 def test_telegram_schema_error_is_actionable() -> None:
     message = _database_error_message(
         SupabaseError(
@@ -113,4 +161,19 @@ def test_schema_and_migration_include_visit_analytics() -> None:
 
     assert "analytics jsonb not null default '{}'::jsonb" in schema.lower()
     assert "add column if not exists analytics jsonb" in migration.lower()
+    assert "notify pgrst, 'reload schema'" in migration.lower()
+
+
+def test_schema_and_migration_include_supporter_keyset_index() -> None:
+    from pathlib import Path
+
+    supabase = Path(__file__).parents[1] / "supabase"
+    schema = (supabase / "supabase_schema.sql").read_text()
+    migration = (
+        supabase / "supabase_migration_v2_5_0_supporter_pagination.sql"
+    ).read_text()
+
+    expected = "is_visible, amount desc, created_at desc, id desc"
+    assert expected in schema.lower()
+    assert expected in migration.lower()
     assert "notify pgrst, 'reload schema'" in migration.lower()

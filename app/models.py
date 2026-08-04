@@ -189,6 +189,8 @@ class SupportersResponse(BaseModel):
     supporters: list[SupporterOut]
     source: str = "supabase"
     stale: bool = False
+    hasMore: bool = False
+    nextCursor: str | None = None
 
 
 class SupporterResponse(BaseModel):

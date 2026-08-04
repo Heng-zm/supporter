@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from uuid import uuid4
 
 from cryptography.hazmat.primitives import hashes, serialization
@@ -149,6 +150,50 @@ def test_api_health_alias() -> None:
         assert response.headers["cache-control"] == "no-store, max-age=0"
 
 
+def test_liveness_and_readiness_are_separate() -> None:
+    client = build_client()
+    client.app.state.audio_settings = SimpleNamespace(
+        enabled=True,
+        resolved_storage_mode="supabase",
+        configuration_error="",
+    )
+    client.app.state.audio_store = SimpleNamespace(storage_ready=True)
+
+    with client:
+        live = client.get("/health/live")
+        ready = client.get("/health/ready")
+
+    assert live.status_code == 200
+    assert live.json()["status"] == "alive"
+    assert ready.status_code == 200
+    assert ready.json()["status"] == "ready"
+    assert ready.json()["checks"]["supabase"] == {"ok": True, "required": True}
+    assert ready.json()["checks"]["visitEncryption"] == {
+        "ok": True,
+        "required": True,
+    }
+
+
+def test_readiness_returns_503_when_required_audio_storage_is_unavailable() -> None:
+    client = build_client()
+    client.app.state.audio_settings = SimpleNamespace(
+        enabled=True,
+        resolved_storage_mode="supabase",
+        configuration_error="storage key missing",
+    )
+    client.app.state.audio_store = SimpleNamespace(storage_ready=False)
+
+    with client:
+        response = client.get("/health/ready")
+
+    assert response.status_code == 503
+    assert response.json()["status"] == "not_ready"
+    assert response.json()["checks"]["audioStorage"] == {
+        "ok": False,
+        "required": True,
+    }
+
+
 def test_public_key_endpoint() -> None:
     with build_client() as client:
         response = client.get("/api/website/public-key")
@@ -156,6 +201,18 @@ def test_public_key_endpoint() -> None:
         body = response.json()
         assert body["algorithm"] == ENCRYPTION_NAME
         assert len(base64.b64decode(body["publicKey"])) > 200
+
+
+def test_v1_routes_are_available_without_removing_legacy_routes() -> None:
+    with build_client() as client:
+        legacy = client.get("/api/supporters")
+        versioned = client.get("/api/v1/supporters")
+        public_key = client.get("/api/v1/website/public-key")
+
+    assert legacy.status_code == 200
+    assert versioned.status_code == 200
+    assert versioned.json()["supporters"] == legacy.json()["supporters"]
+    assert public_key.status_code == 200
 
 
 def test_plain_visit_is_rejected() -> None:
@@ -204,6 +261,78 @@ def test_list_supporters_still_available_for_admin_use() -> None:
         assert response.json()["source"] == "memory-cache"
         assert response.json()["stale"] is False
         assert response.headers["x-supporters-source"] == "memory-cache"
+
+
+def test_supporter_list_uses_signed_keyset_cursor() -> None:
+    class FakePagedSupabase(FakeSupabase):
+        def __init__(self) -> None:
+            super().__init__()
+            self.supporters = [
+                {
+                    "id": "00000000-0000-0000-0000-000000000003",
+                    "name": "First",
+                    "amount": "30.00",
+                    "currency": "USD",
+                    "created_at": "2026-07-25T03:00:00Z",
+                },
+                {
+                    "id": "00000000-0000-0000-0000-000000000002",
+                    "name": "Second",
+                    "amount": "20.00",
+                    "currency": "USD",
+                    "created_at": "2026-07-25T02:00:00Z",
+                },
+                {
+                    "id": "00000000-0000-0000-0000-000000000001",
+                    "name": "Third",
+                    "amount": "10.00",
+                    "currency": "USD",
+                    "created_at": "2026-07-25T01:00:00Z",
+                },
+            ]
+
+        async def list_supporters_page(self, limit, cursor):
+            ids = [row["id"] for row in self.supporters]
+            start = ids.index(str(cursor.supporter_id)) + 1
+            return self.supporters[start : start + limit]
+
+    with build_client(FakePagedSupabase()) as client:
+        first = client.get("/api/v1/supporters", params={"limit": 2})
+        cursor = first.json()["nextCursor"]
+        second = client.get(
+            "/api/v1/supporters",
+            params={"limit": 2, "cursor": cursor},
+        )
+        tampered = client.get(
+            "/api/v1/supporters",
+            params={"limit": 2, "cursor": f"{cursor}x"},
+        )
+
+    assert first.status_code == 200
+    assert [row["name"] for row in first.json()["supporters"]] == ["First", "Second"]
+    assert first.json()["hasMore"] is True
+    assert cursor
+    assert second.status_code == 200
+    assert [row["name"] for row in second.json()["supporters"]] == ["Third"]
+    assert second.json()["hasMore"] is False
+    assert second.json()["nextCursor"] is None
+    assert tampered.status_code == 400
+    assert tampered.headers["content-type"].startswith("application/problem+json")
+    assert tampered.json()["errorCode"] == "invalid_supporter_cursor"
+
+
+def test_validation_errors_use_rfc_9457_problem_details() -> None:
+    with build_client() as client:
+        response = client.get("/api/v1/supporters", params={"limit": 0})
+
+    body = response.json()
+    assert response.status_code == 422
+    assert response.headers["content-type"].startswith("application/problem+json")
+    assert body["type"] == "urn:ozo-api:problem:validation_error"
+    assert body["status"] == response.status_code
+    assert body["errorCode"] == "validation_error"
+    assert body["requestId"] == response.headers["x-request-id"]
+    assert body["errors"][0]["pointer"] == "/limit"
 
 
 def test_stale_supporters_are_returned_without_breaking_public_list() -> None:

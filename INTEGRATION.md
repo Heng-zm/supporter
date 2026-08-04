@@ -27,8 +27,8 @@ python scripts/check_audio_routes.py
 Expected routes:
 
 ```text
-/api/audio/metadata
-/api/audio/file
+/api/v1/audio/metadata
+/api/v1/audio/file
 /api/telegram/webhook
 ```
 
@@ -112,11 +112,11 @@ If upload or manifest publication fails, the randomized encrypted object is remo
 ## 8. API behavior
 
 ```text
-GET /api/audio/metadata
-GET /api/audio/file?version=<active-version>
+GET /api/v1/audio/metadata
+GET /api/v1/audio/file?version=<active-version>
 ```
 
-`/api/audio/file` streams authenticated plaintext from encrypted storage. It supports a single HTTP byte range and returns `206` when valid. The key and ciphertext are never sent to React.
+`/api/v1/audio/file` streams authenticated plaintext from encrypted storage. It supports a single HTTP byte range and returns `206` when valid. The key and ciphertext are never sent to React. The legacy `/api/audio/*` aliases remain available during migration.
 
 ## 9. Key rotation
 

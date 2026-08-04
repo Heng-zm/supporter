@@ -44,6 +44,15 @@ def test_invalid_request_id_is_replaced() -> None:
     assert len(response.headers["x-request-id"]) == 32
 
 
+def test_docs_prefix_lookalike_keeps_content_security_policy() -> None:
+    app = create_app(Settings(require_encrypted_visits=False, trust_proxy_headers=False))
+    with TestClient(app) as client:
+        response = client.get("/docs-not-a-real-route")
+
+    assert response.status_code == 404
+    assert "default-src 'none'" in response.headers["content-security-policy"]
+
+
 def test_production_disables_docs_and_hides_health_details() -> None:
     app = create_app(_production_settings())
     with TestClient(app, base_url="https://api.example.com") as client:
@@ -52,6 +61,8 @@ def test_production_disables_docs_and_hides_health_details() -> None:
         root = client.get("/")
 
     assert docs.status_code == 404
+    assert docs.headers["content-type"].startswith("application/problem+json")
+    assert docs.json()["errorCode"] == "not_found"
     assert health.status_code == 200
     assert "environment" not in health.json()
     assert "supabaseConfigured" not in health.json()
@@ -67,7 +78,35 @@ def test_production_rejects_plain_http_api_requests() -> None:
 
     assert response.status_code == 400
     assert response.json()["detail"] == "HTTPS is required."
+    assert response.json()["errorCode"] == "https_required"
+    assert response.headers["content-type"].startswith("application/problem+json")
     assert health.status_code == 200
+
+
+def test_invalid_host_uses_problem_details() -> None:
+    app = create_app(_production_settings())
+    with TestClient(app, base_url="https://attacker.example") as client:
+        response = client.get("/api/v1/supporters")
+
+    assert response.status_code == 400
+    assert response.headers["content-type"].startswith("application/problem+json")
+    assert response.json()["errorCode"] == "invalid_host"
+
+
+def test_rejected_cors_preflight_uses_problem_details() -> None:
+    app = create_app(Settings(require_encrypted_visits=False, trust_proxy_headers=False))
+    with TestClient(app) as client:
+        response = client.options(
+            "/api/v1/supporters",
+            headers={
+                "Origin": "https://attacker.example",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.headers["content-type"].startswith("application/problem+json")
+    assert response.json()["errorCode"] == "cors_preflight_rejected"
 
 
 def test_admin_api_is_hidden_when_disabled() -> None:

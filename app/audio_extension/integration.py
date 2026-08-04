@@ -14,10 +14,28 @@ from .telegram import TelegramAudioController
 logger = logging.getLogger(__name__)
 
 
-def include_audio_router(app: FastAPI, *, api_prefix: str = "/api") -> None:
-    if getattr(app.state, "audio_router_included", False):
+def include_audio_router(
+    app: FastAPI,
+    *,
+    api_prefix: str = "/api",
+    include_in_schema: bool = True,
+) -> None:
+    normalized_prefix = api_prefix.rstrip("/")
+    raw_prefixes = getattr(app.state, "audio_router_prefixes", ())
+    prefixes = (
+        set(raw_prefixes)
+        if isinstance(raw_prefixes, (set, frozenset, tuple))
+        else set()
+    )
+    if normalized_prefix in prefixes:
         return
-    app.include_router(router, prefix=api_prefix.rstrip("/"))
+    app.include_router(
+        router,
+        prefix=normalized_prefix,
+        include_in_schema=include_in_schema,
+    )
+    prefixes.add(normalized_prefix)
+    app.state.audio_router_prefixes = frozenset(prefixes)
     app.state.audio_router_included = True
 
 
