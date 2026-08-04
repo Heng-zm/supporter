@@ -176,7 +176,10 @@ async def http_exception_handler(
 
 
 def _validation_pointer(location: tuple[Any, ...]) -> str:
-    parts = [str(part) for part in location if part not in {"body", "query"}]
+    parts = list(location)
+    if parts and parts[0] in {"body", "query"}:
+        parts = parts[1:]
+    parts = [str(part) for part in parts]
     escaped = [part.replace("~", "~0").replace("/", "~1") for part in parts]
     return "/" + "/".join(escaped) if escaped else "/"
 

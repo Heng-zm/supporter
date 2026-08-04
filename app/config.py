@@ -5,7 +5,7 @@ import binascii
 import ipaddress
 import json
 import re
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from urllib.parse import urlparse
 
 from pydantic import Field, field_validator, model_validator
@@ -179,15 +179,15 @@ class Settings(BaseSettings):
         values = _split_csv(self.allowed_hosts_raw)
         return values or ["*"]
 
-    @property
+    @cached_property
     def trusted_proxy_networks(self) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
         return _parse_networks(self.trusted_proxy_networks_raw, "TRUSTED_PROXY_NETWORKS")
 
-    @property
+    @cached_property
     def admin_allowed_networks(self) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
         return _parse_networks(self.admin_allowed_networks_raw, "ADMIN_ALLOWED_NETWORKS")
 
-    @property
+    @cached_property
     def telegram_webhook_allowed_networks(
         self,
     ) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
@@ -196,7 +196,7 @@ class Settings(BaseSettings):
             "TELEGRAM_WEBHOOK_ALLOWED_NETWORKS",
         )
 
-    @property
+    @cached_property
     def telegram_admin_user_ids(self) -> frozenset[int]:
         values: set[int] = set()
         for item in _split_csv(self.telegram_admin_user_ids_raw):

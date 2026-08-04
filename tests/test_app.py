@@ -4,6 +4,7 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import APP_VERSION, create_app
+from app.problems import _validation_pointer
 from app.services.telegram_commands import TelegramCommandService
 
 
@@ -339,3 +340,85 @@ async def test_body_limit_rejects_chunked_payload_without_content_length() -> No
 
     assert sent[0]["type"] == "http.response.start"
     assert sent[0]["status"] == 413
+
+
+async def test_body_limit_rejects_malformed_content_length() -> None:
+    from app.middleware.body_limit import RequestBodyLimitMiddleware
+
+    async def receive() -> dict[str, object]:
+        raise AssertionError("A rejected request body must not be read.")
+
+    async def downstream(scope, receive, send) -> None:
+        raise AssertionError("A malformed request must not reach the application.")
+
+    sent: list[dict[str, object]] = []
+
+    async def send(message: dict[str, object]) -> None:
+        sent.append(message)
+
+    for headers in (
+        [(b"content-length", b"-1")],
+        [(b"content-length", b"invalid")],
+        [(b"content-length", b"1"), (b"content-length", b"2")],
+    ):
+        sent.clear()
+
+        middleware = RequestBodyLimitMiddleware(downstream, max_bytes=4096)
+        await middleware(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/",
+                "headers": headers,
+                "query_string": b"",
+                "server": ("test", 80),
+                "client": ("127.0.0.1", 1234),
+                "scheme": "http",
+            },
+            receive,
+            send,
+        )
+
+        assert sent[0]["type"] == "http.response.start"
+        assert sent[0]["status"] == 400
+        assert b"application/problem+json" in dict(sent[0]["headers"])[b"content-type"]
+        assert b"invalid_content_length" in sent[1]["body"]
+
+
+async def test_body_limit_rejects_huge_numeric_content_length_without_parsing() -> None:
+    from app.middleware.body_limit import RequestBodyLimitMiddleware
+
+    sent: list[dict[str, object]] = []
+
+    async def receive() -> dict[str, object]:
+        raise AssertionError("A rejected request body must not be read.")
+
+    async def send(message: dict[str, object]) -> None:
+        sent.append(message)
+
+    async def downstream(scope, receive, send) -> None:
+        raise AssertionError("An oversized request must not reach the application.")
+
+    middleware = RequestBodyLimitMiddleware(downstream, max_bytes=4096)
+    await middleware(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/",
+            "headers": [(b"content-length", b"9" * 5000)],
+            "query_string": b"",
+            "server": ("test", 80),
+            "client": ("127.0.0.1", 1234),
+            "scheme": "http",
+        },
+        receive,
+        send,
+    )
+
+    assert sent[0]["status"] == 413
+    assert b"payload_too_large" in sent[1]["body"]
+
+
+def test_validation_pointer_only_removes_the_location_prefix() -> None:
+    assert _validation_pointer(("body", "query", "value")) == "/query/value"
+    assert _validation_pointer(("query", "body")) == "/body"

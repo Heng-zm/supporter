@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import logging
 import re
 import secrets
@@ -18,6 +19,51 @@ from app.utils.network import request_is_https_scope
 logger = logging.getLogger("app.request")
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{8,64}$")
 _HEALTH_PATHS = frozenset({"/health", "/health/live", "/health/ready"})
+
+
+def _normalized_hostname(value: str) -> str:
+    value = value.strip()
+    if not value:
+        return ""
+
+    if value.startswith("["):
+        closing_bracket = value.find("]")
+        if closing_bracket < 0:
+            return ""
+        hostname = value[1:closing_bracket]
+        suffix = value[closing_bracket + 1 :]
+        if suffix and not (suffix.startswith(":") and suffix[1:].isdigit()):
+            return ""
+        try:
+            return ipaddress.IPv6Address(hostname).compressed
+        except ValueError:
+            return ""
+
+    if value.count(":") == 1:
+        hostname, port = value.rsplit(":", 1)
+        if not port.isdigit():
+            return ""
+        value = hostname
+    elif ":" in value:
+        # RFC Host headers require brackets around IPv6 literals.
+        return ""
+
+    return value.lower().rstrip(".")
+
+
+def _normalized_host_pattern(value: str) -> str:
+    value = value.strip()
+    if value == "*":
+        return value
+    if value.startswith("*."):
+        suffix = _normalized_hostname(value[2:])
+        return f"*.{suffix}" if suffix else ""
+    if ":" in value and not value.startswith("["):
+        try:
+            return ipaddress.IPv6Address(value).compressed
+        except ValueError:
+            pass
+    return _normalized_hostname(value)
 
 
 class ProblemCORSMiddleware(CORSMiddleware):
@@ -60,7 +106,12 @@ class ProblemTrustedHostMiddleware:
         allowed_hosts: Sequence[str] | None = None,
         www_redirect: bool = True,
     ) -> None:
-        values = list(allowed_hosts or ["*"])
+        values = [
+            _normalized_host_pattern(value)
+            for value in (allowed_hosts or ["*"])
+        ]
+        if any(not value for value in values):
+            raise ValueError("Allowed hosts must contain valid hostnames or IP addresses.")
         for pattern in values:
             if "*" in pattern[1:] or (
                 pattern.startswith("*")
@@ -79,7 +130,7 @@ class ProblemTrustedHostMiddleware:
             return
 
         headers = Headers(scope=scope)
-        host = headers.get("host", "").split(":")[0]
+        host = _normalized_hostname(headers.get("host", ""))
         is_valid = False
         found_www_redirect = False
         for pattern in self.allowed_hosts:

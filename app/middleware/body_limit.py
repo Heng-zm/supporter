@@ -19,15 +19,26 @@ class RequestBodyLimitMiddleware:
             await self.app(scope, receive, send)
             return
 
-        headers = {key.lower(): value for key, value in scope.get("headers", [])}
-        raw_content_length = headers.get(b"content-length")
-        if raw_content_length is not None:
-            try:
-                content_length = int(raw_content_length)
-            except ValueError:
-                content_length = 0
-            if content_length > self.max_bytes:
-                await self._reject(scope, receive, send)
+        content_lengths = [
+            value.strip()
+            for key, value in scope.get("headers", [])
+            if key.lower() == b"content-length"
+        ]
+        if content_lengths:
+            if (
+                len(set(content_lengths)) != 1
+                or not content_lengths[0]
+                or not content_lengths[0].isdigit()
+            ):
+                await self._reject_invalid_length(scope, receive, send)
+                return
+            canonical_length = content_lengths[0].lstrip(b"0") or b"0"
+            maximum = str(self.max_bytes).encode("ascii")
+            if len(canonical_length) > len(maximum) or (
+                len(canonical_length) == len(maximum)
+                and canonical_length > maximum
+            ):
+                await self._reject_too_large(scope, receive, send)
                 return
 
         received = 0
@@ -55,14 +66,28 @@ class RequestBodyLimitMiddleware:
                 # A streaming endpoint has already started its response, so a
                 # second response cannot be emitted safely. Close the request.
                 raise
-            await self._reject(scope, receive, send)
+            await self._reject_too_large(scope, receive, send)
 
     @staticmethod
-    async def _reject(scope: Scope, receive: Receive, send: Send) -> None:
+    async def _reject_too_large(scope: Scope, receive: Receive, send: Send) -> None:
         response = problem_response(
             scope,
             status_code=413,
             detail="Request body is too large.",
             error_code="payload_too_large",
+        )
+        await response(scope, receive, send)
+
+    @staticmethod
+    async def _reject_invalid_length(
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        response = problem_response(
+            scope,
+            status_code=400,
+            detail="The Content-Length header is invalid.",
+            error_code="invalid_content_length",
         )
         await response(scope, receive, send)

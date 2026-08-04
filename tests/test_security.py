@@ -93,6 +93,27 @@ def test_invalid_host_uses_problem_details() -> None:
     assert response.json()["errorCode"] == "invalid_host"
 
 
+def test_allowed_host_comparison_is_case_insensitive() -> None:
+    app = create_app(_production_settings())
+    with TestClient(app, base_url="https://api.example.com") as client:
+        response = client.get(
+            "/health/live",
+            headers={"Host": "API.EXAMPLE.COM.:443"},
+        )
+
+    assert response.status_code == 200
+
+
+def test_bracketed_ipv6_host_with_port_is_supported() -> None:
+    app = create_app(_production_settings(allowed_hosts_raw="::1"))
+    # Starlette's test transport cannot parse an IPv6 base URL, so provide the
+    # RFC-compliant Host header separately from the transport address.
+    with TestClient(app, base_url="https://testserver") as client:
+        response = client.get("/health/live", headers={"Host": "[::1]:443"})
+
+    assert response.status_code == 200
+
+
 def test_rejected_cors_preflight_uses_problem_details() -> None:
     app = create_app(Settings(require_encrypted_visits=False, trust_proxy_headers=False))
     with TestClient(app) as client:
